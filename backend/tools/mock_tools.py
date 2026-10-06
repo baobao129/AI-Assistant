@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.tools.contracts import RegisteredTool, ToolError, ToolMetadata, ToolResult
 from backend.tools.registry import ToolRegistry
-from backend.tools.sql_validator import DevelopmentSQLValidator, SQLValidator
+from backend.tools.sql_validator import ProjectSQLValidator, SQLValidator
 
 
 class KnowledgeSearchInput(BaseModel):
@@ -79,7 +79,7 @@ class DatabaseQueryTool(RegisteredTool):
     input_model = DatabaseQueryInput
 
     def __init__(self, validator: SQLValidator | None = None) -> None:
-        self.validator = validator or DevelopmentSQLValidator()
+        self.validator = validator or ProjectSQLValidator()
 
     def execute(self, tool_call_id: str, arguments: DatabaseQueryInput) -> ToolResult:
         # The validator boundary is explicit; the Phase 1 executor has no database side effect.
