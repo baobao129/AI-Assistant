@@ -1,0 +1,127 @@
+name: enterprise-agent
+services:
+  mysql:
+    image: mysql:8.4.8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Generate .env first}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-enterprise_agent}
+      MYSQL_USER: ${MYSQL_USER:-agent_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Generate .env first}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --user="$$MYSQL_USER" --database="$$MYSQL_DATABASE" --execute="SELECT 1" >/dev/null 2>&1']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: [CMD, etcdctl, endpoint, health]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  minio:
+    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?Generate .env first}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?Generate .env first}
+    command: minio server /minio_data --console-address :9001
+    volumes:
+      - minio_data:/minio_data
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.6.25
+    command: [milvus, run, standalone]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?Generate .env first}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?Generate .env first}
+      MQ_TYPE: woodpecker
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, curl, -f, http://127.0.0.1:9091/healthz]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 90s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-enterprise_agent}
+      MYSQL_USER: ${MYSQL_USER:-agent_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Generate .env first}
+      MILVUS_URI: http://milvus:19530
+      CHECKPOINT_MODE: ${CHECKPOINT_MODE:-memory}
+      CHECKPOINT_SQLITE_PATH: /app/runtime/checkpoints.sqlite
+      MAX_TOOL_ITERATIONS: ${MAX_TOOL_ITERATIONS:-8}
+      MAX_REPAIR_ATTEMPTS: ${MAX_REPAIR_ATTEMPTS:-3}
+      MAX_ANSWER_REVISIONS: ${MAX_ANSWER_REVISIONS:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - checkpoint_data:/app/runtime
+    ports:
+      - 127.0.0.1:${BACKEND_PORT:-8000}:8000
+    depends_on:
+      mysql: {condition: service_healthy}
+      milvus: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10)"]
+      interval: 15s
+      timeout: 12s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: frontend
+    ports:
+      - 127.0.0.1:${FRONTEND_PORT:-5173}:8080
+    depends_on:
+      backend: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  checkpoint_data:
