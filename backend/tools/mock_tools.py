@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.tools.contracts import RegisteredTool, ToolError, ToolMetadata, ToolResult
 from backend.tools.registry import ToolRegistry
+from backend.tools.sql_validator import DevelopmentSQLValidator, SQLValidator
 
 
 class KnowledgeSearchInput(BaseModel):
@@ -77,19 +78,19 @@ class DatabaseQueryTool(RegisteredTool):
     metadata = ToolMetadata("database_query", "1", "medium", "structured_query")
     input_model = DatabaseQueryInput
 
+    def __init__(self, validator: SQLValidator | None = None) -> None:
+        self.validator = validator or DevelopmentSQLValidator()
+
     def execute(self, tool_call_id: str, arguments: DatabaseQueryInput) -> ToolResult:
         # The validator boundary is explicit; the Phase 1 executor has no database side effect.
-        if ";" in arguments.sql.rstrip("; ") or not arguments.sql.lstrip().lower().startswith(
-            "select"
-        ):
+        validation = self.validator.validate(arguments.sql)
+        if validation.status != "accepted":
             return ToolResult(
                 tool_id=self.metadata.tool_id,
                 tool_call_id=tool_call_id,
                 status="rejected",
-                error=ToolError(
-                    code="sql_rejected", message="Only a single read-only SELECT is allowed."
-                ),
-                metadata={"sql_validation": "rejected"},
+                error=ToolError(code="sql_rejected", message="SQL did not pass the validator."),
+                metadata={"sql_validation": validation.status, "reason": validation.reason},
             )
         return ToolResult(
             tool_id=self.metadata.tool_id,

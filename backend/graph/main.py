@@ -5,6 +5,7 @@ from langgraph.graph import END, START, StateGraph
 from backend.domain.state import GraphState
 from backend.graph.policies import ExecutionBudgets
 from backend.graph.validation import validate_answer
+from backend.infrastructure.llm import GeneralLLM, MockGeneralLLM
 from backend.tools.registry import ToolExecutor
 
 KNOWLEDGE_TERMS = ("document", "policy", "manual", "contract", "knowledge", "文档", "政策", "手册")
@@ -99,8 +100,8 @@ def generation(state: GraphState) -> dict[str, object]:
     return {"answer_candidate": answer, "messages": [{"role": "assistant", "content": answer}]}
 
 
-def general_chat(state: GraphState) -> dict[str, object]:
-    answer = f"General response: {state['user_input'].strip()}"
+def general_chat(state: GraphState, llm: GeneralLLM) -> dict[str, object]:
+    answer = llm.generate(state["user_input"], state)
     return {"answer_candidate": answer, "messages": [{"role": "assistant", "content": answer}]}
 
 
@@ -217,11 +218,13 @@ def build_main_graph(
     executor: ToolExecutor | None = None,
     checkpointer: object | None = None,
     budgets: ExecutionBudgets | None = None,
+    general_llm: GeneralLLM | None = None,
 ):
     from backend.tools.mock_tools import default_registry
 
     tool_executor = executor or ToolExecutor(default_registry())
     limits = budgets or ExecutionBudgets()
+    llm = general_llm or MockGeneralLLM()
     graph = StateGraph(GraphState)
     graph.add_node("request_initialize", request_initialize)
     graph.add_node("intent_router", intent_router)
@@ -229,7 +232,7 @@ def build_main_graph(
     graph.add_node("response_assembly", response_assembly)
     graph.add_node("answer_validation", validate_answer)
     graph.add_node("response_finalize", response_finalize)
-    graph.add_node("general_chat", general_chat)
+    graph.add_node("general_chat", lambda state: general_chat(state, llm))
     for name, node in _build_rag_nodes(tool_executor).items():
         graph.add_node(name, node)
     graph.add_node("model_node", sql_model_node)
