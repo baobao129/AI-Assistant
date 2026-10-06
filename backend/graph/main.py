@@ -5,7 +5,14 @@ from langgraph.graph import END, START, StateGraph
 from backend.domain.state import GraphState
 from backend.graph.policies import ExecutionBudgets
 from backend.graph.validation import validate_answer
-from backend.infrastructure.llm import GeneralLLM, MockGeneralLLM
+from backend.infrastructure.config import Settings
+from backend.infrastructure.llm import (
+    CapabilityResolver,
+    GeneralLLM,
+    MockGeneralLLM,
+    UnsupportedCapabilityError,
+    create_llm_provider,
+)
 from backend.tools.registry import ToolExecutor
 
 KNOWLEDGE_TERMS = ("document", "policy", "manual", "contract", "knowledge", "文档", "政策", "手册")
@@ -44,26 +51,39 @@ def request_initialize(state: GraphState) -> dict[str, object]:
     }
 
 
+class IntentRouter:
+    """Deterministic MVP classifier with explicit safe routing outcomes."""
+
+    def route(self, user_input: str) -> dict[str, object]:
+        query = user_input.strip()
+        lowered = query.casefold()
+        if not query:
+            return {"intent": None, "routing_outcome": "invalid_request", "current_path": None}
+        if "__routing_error__" in lowered:
+            return {"intent": None, "routing_outcome": "routing_error", "current_path": None}
+        knowledge = any(term in lowered for term in KNOWLEDGE_TERMS)
+        structured = any(term in lowered for term in STRUCTURED_TERMS)
+        if knowledge and structured:
+            return {
+                "intent": None,
+                "routing_outcome": "unsupported_mixed_query",
+                "current_path": None,
+            }
+        if knowledge:
+            return {"intent": "knowledge", "routing_outcome": "routed", "current_path": "knowledge"}
+        if structured:
+            return {
+                "intent": "structured_data",
+                "routing_outcome": "routed",
+                "current_path": "structured_data",
+            }
+        return {"intent": "general", "routing_outcome": "routed", "current_path": "general"}
+
+    classify = route
+
+
 def intent_router(state: GraphState) -> dict[str, object]:
-    query = state["user_input"].strip()
-    lowered = query.casefold()
-    if not query:
-        return {"intent": None, "routing_outcome": "invalid_request", "current_path": None}
-    if "__routing_error__" in lowered:
-        return {"intent": None, "routing_outcome": "routing_error", "current_path": None}
-    knowledge = any(term in lowered for term in KNOWLEDGE_TERMS)
-    structured = any(term in lowered for term in STRUCTURED_TERMS)
-    if knowledge and structured:
-        return {"intent": None, "routing_outcome": "unsupported_mixed_query", "current_path": None}
-    if knowledge:
-        return {"intent": "knowledge", "routing_outcome": "routed", "current_path": "knowledge"}
-    if structured:
-        return {
-            "intent": "structured_data",
-            "routing_outcome": "routed",
-            "current_path": "structured_data",
-        }
-    return {"intent": "general", "routing_outcome": "routed", "current_path": "general"}
+    return IntentRouter().route(state["user_input"])
 
 
 def retrieval(state: GraphState, executor: ToolExecutor) -> dict[str, object]:
@@ -101,11 +121,25 @@ def generation(state: GraphState) -> dict[str, object]:
 
 
 def general_chat(state: GraphState, llm: GeneralLLM) -> dict[str, object]:
-    answer = llm.generate(state["user_input"], state)
+    try:
+        answer = llm.generate(state["user_input"], state)
+    except Exception:
+        answer = "The configured LLM could not complete the request safely."
     return {"answer_candidate": answer, "messages": [{"role": "assistant", "content": answer}]}
 
 
-def sql_model_node(state: GraphState) -> dict[str, object]:
+def sql_model_node(state: GraphState, llm: object | None = None) -> dict[str, object]:
+    if llm is not None:
+        try:
+            CapabilityResolver.require(llm, "tool_calling")
+        except UnsupportedCapabilityError:
+            return {
+                "tool_calls": [],
+                "error": {
+                    "code": "unsupported_capability",
+                    "message": "The configured LLM does not support Structured Data tool calling.",
+                },
+            }
     if state.get("tool_results"):
         answer = (
             "Structured data tool results were received; the bounded skeleton "
@@ -181,6 +215,11 @@ def response_assembly(state: GraphState) -> dict[str, object]:
         return {"answer_candidate": "Please provide a non-empty request."}
     if state.get("routing_outcome") == "routing_error":
         return {"answer_candidate": "The request could not be routed safely."}
+    error = state.get("error") or {}
+    if error.get("code") == "unsupported_capability":
+        return {
+            "answer_candidate": error.get("message", "The selected LLM capability is unavailable."),
+        }
     return {"answer_candidate": "The selected path completed without a response candidate."}
 
 
@@ -219,12 +258,13 @@ def build_main_graph(
     checkpointer: object | None = None,
     budgets: ExecutionBudgets | None = None,
     general_llm: GeneralLLM | None = None,
+    settings: Settings | None = None,
 ):
     from backend.tools.mock_tools import default_registry
 
     tool_executor = executor or ToolExecutor(default_registry())
     limits = budgets or ExecutionBudgets()
-    llm = general_llm or MockGeneralLLM()
+    llm = general_llm or (create_llm_provider(settings) if settings else MockGeneralLLM())
     graph = StateGraph(GraphState)
     graph.add_node("request_initialize", request_initialize)
     graph.add_node("intent_router", intent_router)
@@ -235,7 +275,7 @@ def build_main_graph(
     graph.add_node("general_chat", lambda state: general_chat(state, llm))
     for name, node in _build_rag_nodes(tool_executor).items():
         graph.add_node(name, node)
-    graph.add_node("model_node", sql_model_node)
+    graph.add_node("model_node", lambda state: sql_model_node(state, llm))
     graph.add_node("tool_executor", lambda state: tool_executor_node(state, tool_executor))
     graph.add_node("tool_result_normalize", tool_result_normalize)
     graph.add_node("sql_done", lambda state: {})

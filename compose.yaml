@@ -89,6 +89,15 @@ services:
       MAX_TOOL_ITERATIONS: ${MAX_TOOL_ITERATIONS:-8}
       MAX_REPAIR_ATTEMPTS: ${MAX_REPAIR_ATTEMPTS:-3}
       MAX_ANSWER_REVISIONS: ${MAX_ANSWER_REVISIONS:-1}
+      LLM_PROVIDER: ${LLM_PROVIDER:-remote}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+      LOCAL_LLM_STREAMING: ${LOCAL_LLM_STREAMING:-false}
+      LOCAL_LLM_STRUCTURED_OUTPUT: ${LOCAL_LLM_STRUCTURED_OUTPUT:-false}
+      LOCAL_LLM_TOOL_CALLING: ${LOCAL_LLM_TOOL_CALLING:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - checkpoint_data:/app/runtime

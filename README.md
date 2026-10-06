@@ -1,7 +1,8 @@
 # Enterprise Multi-Source AI Agent
 
-Phase 0/1 implementation only. Canonical behavior remains in `docs/contracts/`.
-This increment provides infrastructure and an internal mock Graph skeleton, not a business demo.
+Phase 0/1/2 implementation. Canonical behavior remains in `docs/contracts/`.
+This increment provides infrastructure, an internal Graph skeleton, and capability-aware LLM adapters;
+it is not yet a business demo.
 
 ## Windows startup
 
@@ -63,4 +64,9 @@ docker compose up -d
 ```
 
 Keep volumes when stopping. Do not use `down -v` unless intentionally deleting local data.
-Phase 2 and later provider/routing, RAG, SQL safety, HITL, auth and SSE work is deferred.
+
+The default LLM profile is remote OpenAI-compatible and does not connect during startup.
+Set `LLM_API_KEY` to enable requests. Local execution is opt-in with `LLM_PROVIDER=local`,
+`LOCAL_LLM_BASE_URL`, and independent `LOCAL_LLM_*` capability flags. A Local profile that
+does not declare `tool_calling` is rejected at the Structured Data Graph boundary.
+Phase 3 RAG indexing, SQL persistence, HITL, authentication, and SSE remain deferred.
