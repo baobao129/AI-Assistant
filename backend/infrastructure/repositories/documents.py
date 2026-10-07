@@ -464,6 +464,19 @@ class DocumentContentRepository:
         return str(row[0]) if row else None
 
 
+# document_chunks.location 的列宽（与建表语句中的 VARCHAR(120) 对齐）。
+# 写入前显式截断，不依赖「当前定位串恰好很短」这一隐含假设。
+MAX_LOCATION_CHARS = 120
+
+
+def bounded_location(location: str | None) -> str | None:
+    """把分块定位串显式约束到 document_chunks.location 的列宽。"""
+
+    if location is None:
+        return None
+    return location[:MAX_LOCATION_CHARS]
+
+
 class ChunkRepository:
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool
@@ -487,7 +500,7 @@ class ChunkRepository:
                         chunk.chunk_role,
                         chunk.ordinal,
                         chunk.content,
-                        chunk.location,
+                        bounded_location(chunk.location),
                         chunk.label,
                         now,
                     )

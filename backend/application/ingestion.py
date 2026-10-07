@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 
 from backend.application.index_registry import IndexRegistry
-from backend.domain.errors import AppError, conflict, not_found, validation_error
+from backend.domain.errors import conflict, not_found, validation_error
 from backend.infrastructure.config import Settings
 from backend.infrastructure.embedding import EmbeddingProvider, EmbeddingProviderError
 from backend.infrastructure.parsers import (
@@ -465,4 +465,4 @@ def _label_for(text: str, block: str, ordinal: int) -> str:
     return first_line[:200]
 
 
-__all__ = ["IngestionService", "UploadOutcome", "AppError"]
+__all__ = ["IngestionService", "UploadOutcome"]
