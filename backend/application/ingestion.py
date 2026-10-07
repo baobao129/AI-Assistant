@@ -132,6 +132,16 @@ class IngestionService:
                     job.status,
                     True,
                 )
+            # An already indexed, available Document is reused as-is. A duplicate
+            # submission must not create an extra index version that is never promoted.
+            if existing.active_index_version:
+                return UploadOutcome(
+                    existing.document_id,
+                    "",
+                    existing.active_index_version,
+                    JOB_STATUS_SUCCESS,
+                    True,
+                )
 
         document = self.documents.create(
             user_id=user_id,
@@ -270,13 +280,13 @@ class IngestionService:
         )
 
     def _extract_text(self, job: IngestionJobRecord, payload: bytes | None) -> str:
-        if job.job_type == "reindex":
+        if payload is None:
+            # Re-index, a retried Job, and any Job resumed without the original bytes use
+            # the normalized text captured at first ingestion.
             stored = self.contents.get(job.document_id)
             if stored is None:
                 raise _IngestionFailure("content_unavailable", "Stored document text is missing.")
             return stored
-        if payload is None:
-            raise _IngestionFailure("content_unavailable", "The uploaded content is unavailable.")
         document = self.documents.get(job.document_id)
         filename = document.source_name if document else "document.txt"
         content_type = document.content_type if document else "text/plain"
