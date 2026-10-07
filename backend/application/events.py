@@ -1,7 +1,7 @@
-"""SSE Application Event delivery and replay (API-005).
+"""SSE Application Event 的投递与重放（API-005）。
 
-Events are the transport/observability record. They never mutate Graph State, and
-the replay store is the Run Event store, not Conversation Persistence.
+事件是传输/可观测性记录。它们绝不修改 Graph State，且重放存储是
+Run Event 存储，而非 Conversation Persistence。
 """
 
 from __future__ import annotations
@@ -70,11 +70,11 @@ class _RunChannel:
 
 
 class RunStreamNotFound(Exception):
-    """Replay was requested for a Run whose stream is unavailable."""
+    """对一个其流不可用的 Run 请求了重放。"""
 
 
 class RunEventPublisher:
-    """Assigns per-Run sequences, persists for replay, and fans out to live listeners."""
+    """分配每个 Run 的序列号、持久化以供重放，并扇出给实时监听者。"""
 
     def __init__(self, *, repository: RunEventRepository, retention_events: int = 1000) -> None:
         self.repository = repository
@@ -101,8 +101,8 @@ class RunEventPublisher:
         if event_type not in SSE_EVENT_TYPES:
             raise ValueError(f"Unsupported SSE event type: {event_type}")
         event_id = new_id()
-        # The store reserves the per-Run sequence atomically; the returned sequence is
-        # authoritative and already stored for this event.
+        # 存储层原子地预留每个 Run 的序列号；返回的序列号是权威值，
+        # 且已为本事件持久化。
         sequence = self.repository.append(
             run_id=run_id,
             event_id=event_id,
@@ -119,10 +119,12 @@ class RunEventPublisher:
             timestamp=to_rfc3339(utc_now()) or "",
             payload=payload,
         )
+        # 周期性按保留上限裁剪该 Run 的事件存储，避免其无限增长。
         if sequence % 50 == 0:
             self.repository.trim(run_id=run_id, keep=self.retention_events)
         channel = self._channel(run_id)
         channel.queue.put(envelope)
+        # 终态事件（final，或带 terminal 标记的 error）之后关闭该 Run 的实时流。
         if event_type == "final" or (event_type == "error" and payload.get("terminal") is True):
             channel.queue.put(_END)
             channel.closed = True
@@ -170,7 +172,7 @@ class RunEventPublisher:
 
 
 class _Subscription:
-    """One live SSE listener with a bounded wait so heartbeats stay possible."""
+    """单个实时 SSE 监听者，采用有界等待以便仍能发送心跳。"""
 
     def __init__(self, *, publisher: RunEventPublisher, run_id: str, channel: _RunChannel) -> None:
         self._publisher = publisher
@@ -179,7 +181,7 @@ class _Subscription:
         self._closed = False
 
     def next(self, timeout: float | None = None) -> EventEnvelope | None:
-        """Return the next event, or ``None`` when the wait timed out."""
+        """返回下一个事件；等待超时则返回 ``None``。"""
 
         if self._closed:
             return None

@@ -34,16 +34,16 @@ class ToolMetadata:
 
 @dataclass(frozen=True)
 class ToolExecutionContext:
-    """Explicit request scope passed to a Tool; it is not Graph State."""
+    """传给 Tool 的显式请求作用域；它不是 Graph State。"""
 
     conversation_id: str | None = None
     thread_id: str | None = None
     run_id: str | None = None
     user_id: str | None = None
     approval_request_id: str | None = None
-    # Immutable Query Result Snapshot bound by an approved proposal, when resuming.
+    # 恢复时由已批准提案绑定的不可变 Query Result Snapshot。
     query_result_id: str | None = None
-    # Server-resolved authorization scope; the model cannot widen it.
+    # 服务端解析出的授权范围；模型无法将其扩大。
     authorized_document_ids: tuple[str, ...] = ()
 
 

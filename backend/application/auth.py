@@ -1,4 +1,4 @@
-"""Minimal authentication service (ADR-018)."""
+"""最小认证服务（ADR-018）。"""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class AuthService:
         self.repository.revoke_session(session.session_id)
 
     def bootstrap_demo_user(self) -> bool:
-        """Create the configured demo user once; never overwrites an existing account."""
+        """仅创建一次配置的 demo 用户；绝不覆盖已存在的账号。"""
 
         username = self.settings.auth_bootstrap_username.strip()
         password = self.settings.auth_bootstrap_password.get_secret_value()

@@ -1,4 +1,4 @@
-"""Document, Ingestion Job, and Structured Data management endpoints (API-007 / API-008)."""
+"""Document、Ingestion Job 与 Structured Data 管理端点（API-007 / API-008）。"""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ async def upload_document(
             ingestion_job_id=outcome.ingestion_job_id, payload=data
         )
         if not scheduled:
-            # Capacity is bounded; the Job stays pending and is surfaced, never hidden.
+            # 容量有界；Job 保持 pending 并如实返回给调用方，绝不隐藏。
             raise validation_error("Ingestion capacity is temporarily exhausted; retry shortly.")
     return DocumentUploadResponse(
         document_id=outcome.document_id,
@@ -205,7 +205,7 @@ def retry_ingestion_job(
     )
 
 
-# Structured Data inspection APIs ------------------------------------------------
+# Structured Data 检查 API ------------------------------------------------
 def _schema_tables(container: Container) -> list[TableResponse]:
     from backend.tools.data_tools import DatabaseSchemaInput, DatabaseSchemaTool
 
@@ -319,7 +319,7 @@ def preview_table(
     container: Container = Depends(get_container),
     user: AuthenticatedUser = Depends(get_current_user),
 ) -> PreviewResponse:
-    """Controlled, authorized, read-only preview. It accepts no SQL."""
+    """受控、已授权、只读的预览接口。不接受任何 SQL。"""
 
     del user
     settings = container.settings
@@ -334,6 +334,7 @@ def preview_table(
     columns = _table_columns(container, table_name)
     if not columns:
         raise not_found("Table was not found.")
+    # table_name 已对照 allowlist，列名来自 schema，取值用绑定参数，不拼接用户输入。
     select_list = ", ".join(f"`{column}`" for column in columns)
     outcome = container.runtime.query_runner.run(
         f"SELECT {select_list} FROM `{table_name}` LIMIT %s OFFSET %s",
@@ -374,6 +375,7 @@ def _table_columns(container: Container, table_name: str) -> list[str]:
 
 
 def _preview_value(value, column: str, masked_columns: tuple[str, ...]):
+    # 脱敏列固定长度遮挡，其余大字段统一截断，避免预览泄露敏感或超长内容。
     if column.casefold() in masked_columns:
         if value is None or value == "":
             return ""

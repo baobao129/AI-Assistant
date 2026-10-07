@@ -1,4 +1,4 @@
-"""Document, index-version, chunk, and ingestion-job persistence (ADR-019)."""
+"""Document、index-version、chunk 与 ingestion-job 的持久化（ADR-019）。"""
 
 from __future__ import annotations
 
@@ -115,6 +115,7 @@ class DocumentRepository:
     ) -> DocumentRecord:
         document_id = new_id()
         now = utc_now()
+        # title/source_name/content_type 按 documents 表列宽显式截断，避免超长写入被拒。
         self.pool.execute(
             "INSERT INTO documents (document_id, user_id, title, source_name, content_type, "
             "content_fingerprint, byte_size, status, created_at, updated_at) "
@@ -407,7 +408,7 @@ class IngestionJobRepository:
         )
         return int(row[0]) if row and row[0] is not None else 0
 
-    # Startup recovery ------------------------------------------------------
+    # 启动恢复 ------------------------------------------------------
     def fail_stale_running(self, *, older_than: datetime) -> int:
         return self.pool.execute(
             "UPDATE ingestion_jobs SET status = %s, failure_code = 'stale_running_job', "
@@ -426,7 +427,7 @@ class IngestionJobRepository:
 
 
 class DocumentContentRepository:
-    """Stores normalized Document text so Re-index does not depend on the original upload."""
+    """保存规范化后的 Document 文本，使 Re-index 不依赖原始上传件。"""
 
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool
@@ -509,10 +510,10 @@ class ChunkRepository:
             )
 
     def list_by_ids(self, chunk_ids: list[str], *, index_version: str | None) -> list[ChunkRecord]:
-        """Fetch chunks by ID; ``index_version=None`` searches across versions.
+        """按 ID 获取 chunk；``index_version=None`` 时跨版本搜索。
 
-        Retrieval can span several active versions, so the caller passes ``None`` and
-        relies on the returned records plus its own authorization set.
+        Retrieval 可能跨越多个活跃版本，因此调用方传入 ``None``，并依赖返回记录与自身的
+        授权集合。
         """
 
         if not chunk_ids:

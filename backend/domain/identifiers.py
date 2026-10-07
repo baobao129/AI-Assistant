@@ -1,4 +1,4 @@
-"""Opaque identifier and time helpers shared by Domain and Application layers."""
+"""Domain 与 Application 层共用的不透明标识符与时间辅助函数。"""
 
 from __future__ import annotations
 
@@ -7,19 +7,19 @@ from uuid import uuid4
 
 
 def new_id() -> str:
-    """Opaque server-generated identifier; clients must not infer meaning from it."""
+    """服务端生成的不透明标识符；客户端不得从中推断任何含义。"""
 
     return uuid4().hex
 
 
 def utc_now() -> datetime:
-    """Naive UTC timestamp for MySQL DATETIME(6) columns."""
+    """用于 MySQL DATETIME(6) 列的朴素（naive）UTC 时间戳。"""
 
     return datetime.now(UTC).replace(tzinfo=None)
 
 
 def to_rfc3339(value: datetime | None) -> str | None:
-    """RFC 3339 UTC representation required by the API Contract."""
+    """API Contract 要求的 RFC 3339 UTC 表示。"""
 
     if value is None:
         return None

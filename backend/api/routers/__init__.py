@@ -1,1 +1,1 @@
-"""Routers for the versioned API."""
+"""版本化 API 的路由器。"""

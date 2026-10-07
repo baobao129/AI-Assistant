@@ -1,7 +1,7 @@
-"""Index Registry: application-owned authority for active index versions (ADR-012).
+"""Index Registry：由 application 持有的 active Index Version 权威来源（ADR-012）。
 
-Retrieval resolves the active version here, never in Milvus. Promotion and
-retirement keep a last-known-good version available when a new one fails.
+检索在此处解析 active version，绝不在 Milvus 中解析。promote 与 retire
+会在新版本失败时保留 last-known-good 版本可用。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class IndexRegistryError(RuntimeError):
-    """The requested index version cannot be served under current application state."""
+    """在当前 application 状态下无法提供所请求的 index version。"""
 
 
 class IndexRegistry:
@@ -35,7 +35,7 @@ class IndexRegistry:
         self.chunks = chunks
 
     def resolve_active_version(self, document_id: str, *, user_id: str) -> str | None:
-        """Return the active version for an authorized, available Document."""
+        """返回某个已授权且可用 Document 的 active version。"""
 
         document = self.documents.get(document_id, user_id=user_id)
         if document is None or document.status != "available":
@@ -48,7 +48,7 @@ class IndexRegistry:
         return version.index_version
 
     def resolve_explicit_version(self, index_version: str, *, user_id: str) -> str:
-        """Explicit retrieval requires an active version, an available Document, and scope."""
+        """显式检索要求 active version、可用的 Document，以及资源范围。"""
 
         version = self.versions.get(index_version)
         if version is None:
@@ -61,15 +61,17 @@ class IndexRegistry:
         return version.index_version
 
     def promote(self, index_version: str) -> bool:
-        """Activate a validated version, then retire the previous active version.
+        """激活一个已校验的版本，然后 retire 之前的 active version。
 
-        Returns ``False`` when the Document is deleted or unavailable, so a
-        background task can never reactivate a deleted Document.
+        当 Document 已删除或不可用时返回 ``False``，因此后台任务
+        绝不可能重新激活一个已删除的 Document。
         """
 
         version = self.versions.get(index_version)
         if version is None:
             raise IndexRegistryError("index_version_not_found")
+        # promote 之前复检 Document 可用性：删除与 promote 可能并发，
+        # 这一步保证已删除的 Document 不会被重新激活。
         if not self.documents.is_available(version.document_id):
             logger.warning("promotion_refused_document_unavailable")
             self.versions.mark_failed(index_version, failure_code="document_not_available")
@@ -87,7 +89,7 @@ class IndexRegistry:
     def chunks_for_context(
         self, *, index_version: str, child_ids: list[str]
     ) -> tuple[list[ChunkRecord], dict[str, ChunkRecord]]:
-        """Return the matched Children plus their Parent Chunk context."""
+        """返回命中的 Children 及其 Parent Chunk 上下文。"""
 
         children = self.chunks.list_by_ids(child_ids, index_version=index_version)
         parent_ids = [

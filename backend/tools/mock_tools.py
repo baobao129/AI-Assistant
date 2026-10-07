@@ -57,7 +57,7 @@ class KnowledgeSearchTool(RegisteredTool):
         arguments: KnowledgeSearchInput,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        # No enterprise evidence is fabricated by the Phase 1 development stub.
+        # Phase 1 开发桩不会捏造任何企业证据。
         return ToolResult(
             tool_id=self.metadata.tool_id,
             tool_call_id=tool_call_id,
@@ -103,7 +103,7 @@ class DatabaseQueryTool(RegisteredTool):
         arguments: DatabaseQueryInput,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        # The validator boundary is explicit; the Phase 1 executor has no database side effect.
+        # 验证器边界是显式的；Phase 1 执行器没有任何数据库副作用。
         validation = self.validator.validate(arguments.sql)
         if validation.status != "accepted":
             return ToolResult(
@@ -138,7 +138,7 @@ class DataExportTool(RegisteredTool):
         arguments: DataExportInput,
         context: ToolExecutionContext | None = None,
     ) -> ToolResult:
-        # Approval is a Graph/Runtime boundary; no artifact is created in this skeleton.
+        # 审批是 Graph/Runtime 的边界；此骨架中不会创建任何产物。
         return ToolResult(
             tool_id=self.metadata.tool_id,
             tool_call_id=tool_call_id,

@@ -1,7 +1,7 @@
-"""Runtime composition root.
+"""运行时组合根（composition root）。
 
-It wires approved adapters, repositories, and services for the API and workers. It
-creates no new abstraction and holds nothing that belongs to Graph State.
+它为 API 与 workers 装配已批准的 adapters、repositories 与 services。
+它不创建任何新抽象，也不持有任何属于 Graph State 的内容。
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ class Runtime:
     _worker_slots: threading.BoundedSemaphore
 
     def try_claim_worker_slot(self) -> bool:
+        # worker 容量有界（由 BoundedSemaphore 限制），用于约束并发的摄取任务数量。
         return self._worker_slots.acquire(blocking=False)
 
     def release_worker_slot(self) -> None:

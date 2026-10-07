@@ -1,4 +1,4 @@
-"""Authentication endpoints (API-002)."""
+"""认证端点（API-002）。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def logout(
     container: Container = Depends(get_container),
     authorization: str | None = Header(default=None),
 ) -> Response:
-    # Repeated logout is idempotent: an unknown or missing token still returns 204.
+    # 重复 logout 是幂等的：未知或缺失的 token 仍返回 204。
     if authorization and authorization.lower().startswith("bearer "):
         container.auth.logout(authorization.split(" ", 1)[1].strip())
     return Response(status_code=204)

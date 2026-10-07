@@ -1,4 +1,4 @@
-"""Approval endpoints (API-006)."""
+"""审批端点（API-006）。"""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _decide(
     )
     stream_url = None
     if result.successor_run_id:
-        # The successor continues execution and has its own SSE sequence.
+        # 后继 Run 继续执行并拥有独立的 SSE 序列。
         dispatcher.dispatch(result.successor_run_id, approval_request_id=approval_request_id)
         stream_url = f"/api/v1/runs/{result.successor_run_id}/events"
     return ApprovalDecisionResponse(

@@ -1,8 +1,7 @@
-"""Parser Adapter boundary (ADR-007) and Parent/Child chunking.
+"""Parser Adapter 边界（ADR-007）与 Parent/Child 分块。
 
-MinerU is the planned formal Parser; ``LightweightParser`` keeps development and
-smoke runs unblocked by extracting text from the formats the Demo uses. A parser
-returns normalized text plus safe metadata and never touches Graph State.
+MinerU 是计划中的正式 Parser；``LightweightParser`` 通过从 Demo 所用格式中抽取文本，
+让开发与 smoke 运行不被阻塞。parser 返回规范化文本与安全元数据，且绝不触碰 Graph State。
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ SUPPORTED_SUFFIXES: tuple[str, ...] = (".txt", ".md", ".markdown", ".csv", ".jso
 
 
 class ParserError(RuntimeError):
-    """The document could not be normalized into text."""
+    """文档无法被规范化为文本。"""
 
 
 @dataclass(frozen=True)
@@ -51,7 +50,7 @@ class DocumentParser(Protocol):
 
 
 class LightweightParser:
-    """Development fallback parser: plain text, Markdown, CSV, and JSON."""
+    """开发用兜底 parser：纯文本、Markdown、CSV 与 JSON。"""
 
     provider_name = "lightweight"
 
@@ -104,7 +103,7 @@ class LightweightParser:
 
 
 class MinerUParser:
-    """Adapter for a MinerU service endpoint; deployment is out of MVP scope."""
+    """面向 MinerU 服务端点的适配器；部署不在 MVP 范围内。"""
 
     provider_name = "mineru"
 
@@ -183,7 +182,7 @@ class ChunkedDocument:
 def chunk_document(
     text: str, *, parent_chars: int, child_chars: int, overlap_chars: int
 ) -> ChunkedDocument:
-    """Split normalized text into bounded Parent sections and overlapping Child chunks."""
+    """把规范化文本切分为有界的 Parent 段落与带重叠的 Child 分块。"""
 
     if parent_chars <= 0 or child_chars <= 0:
         raise ValueError("chunk sizes must be positive")
@@ -225,7 +224,7 @@ def _split_blocks(text: str, parent_chars: int) -> list[str]:
         current = paragraph
     if current:
         blocks.append(current)
-    # A single oversized paragraph is hard-split so no Parent chunk is unbounded.
+    # 超长单段落会被硬切，保证没有无界的 Parent chunk。
     bounded: list[str] = []
     for block in blocks:
         while len(block) > parent_chars * 2:

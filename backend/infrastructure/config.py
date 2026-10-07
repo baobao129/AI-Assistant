@@ -6,16 +6,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Typed runtime configuration; secrets are never hard-coded here."""
+    """类型化运行时配置；此处绝不硬编码密钥。"""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
-    # Runtime
+    # 运行时
     environment: Literal["development", "test", "production"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     initialize_schema_on_startup: bool = True
 
-    # MySQL application data
+    # MySQL 应用数据
     mysql_host: str = "mysql"
     mysql_port: int = Field(default=3306, ge=1, le=65535)
     mysql_database: str = "enterprise_agent"
@@ -24,15 +24,15 @@ class Settings(BaseSettings):
     mysql_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     mysql_pool_size: int = Field(default=5, ge=1, le=20)
 
-    # MySQL read-only account used only by the SQL Agent query path. It always
-    # targets the same server as the application account; only the credential differs.
+    # 仅供 SQL Agent 查询路径使用的 MySQL 只读账号；它与应用账号指向同一台
+    # 服务器，区别只在凭据。
     mysql_readonly_user: str = "agent_readonly"
     mysql_readonly_password: SecretStr = SecretStr("")
     mysql_readonly_pool_size: int = Field(default=3, ge=1, le=10)
-    # Administrative credential used once to bootstrap the read-only account; never logged.
+    # 仅用于一次性引导创建只读账号的管理凭据；绝不写入日志。
     mysql_root_password: SecretStr = SecretStr("")
 
-    # Vector store
+    # 向量存储
     milvus_uri: str = "http://milvus:19530"
     milvus_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     checkpoint_mode: Literal["memory", "sqlite"] = "memory"
     checkpoint_sqlite_path: Path = Path("runtime/checkpoints.sqlite")
 
-    # Bounded execution budgets
+    # 有界执行预算
     max_tool_iterations: int = Field(default=8, ge=1, le=8)
     max_repair_attempts: int = Field(default=3, ge=0, le=3)
     max_answer_revisions: int = Field(default=1, ge=0, le=1)
@@ -56,11 +56,11 @@ class Settings(BaseSettings):
     local_llm_streaming: bool = False
     local_llm_structured_output: bool = False
     local_llm_tool_calling: bool = False
-    # Structured Data Agent model selection: "auto" follows the LLM provider and uses
-    # the deterministic agent for the mock/extractive development profiles.
+    # 结构化数据 Agent 的模型选择："auto" 跟随 LLM provider，并在 mock/extractive
+    # 开发档位下使用确定性的 agent。
     sql_agent_provider: Literal["auto", "llm", "scripted"] = "auto"
 
-    # Embedding provider (SiliconFlow is the MVP remote provider)
+    # Embedding provider（SiliconFlow 是 MVP 的远程 provider）
     embedding_provider: Literal["siliconflow", "deterministic"] = "siliconflow"
     embedding_base_url: str = "https://api.siliconflow.cn/v1"
     embedding_model: str = "BAAI/bge-m3"
@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     mineru_base_url: str = "http://mineru:8000"
     parser_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
-    # Chunking and context bounds
+    # 分块与上下文边界
     max_document_bytes: int = Field(default=5_242_880, ge=1024)
     max_upload_files: int = Field(default=1, ge=1, le=10)
     chunk_size_chars: int = Field(default=800, ge=100, le=4000)
@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     max_context_chars: int = Field(default=6000, ge=500, le=50000)
     max_citations: int = Field(default=20, ge=1, le=100)
 
-    # Structured data policy
+    # 结构化数据策略
     data_source_id: str = "demo_sales"
     schema_version: str = "demo-1"
     allowed_tables: str = "sales_orders,procurement_orders,products"
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     query_result_retention_seconds: int = Field(default=86400, ge=60, le=604800)
     query_result_max_rows: int = Field(default=1000, ge=1, le=10000)
 
-    # Authentication
+    # 认证
     auth_session_ttl_seconds: int = Field(default=43200, ge=300, le=604800)
     auth_bootstrap_username: str = "demo"
     auth_bootstrap_password: SecretStr = SecretStr("")
@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     approval_expiry_seconds: int = Field(default=1800, ge=60, le=86400)
     export_max_rows: int = Field(default=5000, ge=1, le=50000)
 
-    # Ingestion workers
+    # Ingestion 后台 worker
     ingestion_stale_running_seconds: int = Field(default=1800, ge=60, le=86400)
     ingestion_orphaned_pending_seconds: int = Field(default=300, ge=30, le=86400)
     ingestion_worker_claim_seconds: int = Field(default=120, ge=10, le=3600)
@@ -124,7 +124,7 @@ class Settings(BaseSettings):
     sse_replay_retention_events: int = Field(default=1000, ge=10, le=10000)
     sse_heartbeat_seconds: float = Field(default=15.0, gt=0, le=60)
 
-    # API bounds
+    # API 边界
     conversations_default_limit: int = Field(default=20, ge=1, le=100)
     conversations_max_limit: int = Field(default=100, ge=1, le=100)
     messages_default_limit: int = Field(default=50, ge=1, le=200)
@@ -144,6 +144,6 @@ class Settings(BaseSettings):
 
     @property
     def readonly_database(self) -> str:
-        """The read-only account lives in the same schema as the application account."""
+        """只读账号与应用账号位于同一 schema 下。"""
 
         return self.mysql_database

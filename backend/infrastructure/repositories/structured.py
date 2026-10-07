@@ -1,4 +1,4 @@
-"""Structured data persistence: immutable Query Result Snapshots and export artifacts."""
+"""结构化数据持久化：不可变的 Query Result Snapshot 与 export artifact。"""
 
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ class QueryResultRepository:
         )
 
     def clear_run_reference(self, run_id: str) -> None:
-        """Detach a Run reference without deleting the immutable snapshot."""
+        """解除 Run 引用但不删除不可变的 snapshot。"""
 
         self.pool.execute("UPDATE query_results SET run_id = NULL WHERE run_id = %s", (run_id,))
 
@@ -142,10 +142,9 @@ class ExportArtifactRepository:
         row_count: int,
         content: str,
     ) -> bool:
-        """Create the Artifact at most once per approval request.
+        """每个 approval request 至多创建一次 Artifact。
 
-        Returns ``True`` when this call created the row. A repeated call keeps the
-        existing row and reports ``False`` so the side effect is not repeated.
+        本调用创建了该行时返回 ``True``；重复调用保留已有行并返回 ``False``，以免重复副作用。
         """
 
         affected = self.pool.execute(

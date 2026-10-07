@@ -16,7 +16,7 @@ CapabilityName = Literal["streaming", "structured_output", "tool_calling"]
 
 @dataclass(frozen=True)
 class LLMCapabilities:
-    """Provider metadata owned by the application, independent of provider name."""
+    """由应用持有的 provider 元数据，与 provider 名称无关。"""
 
     streaming: bool = False
     structured_output: bool = False
@@ -29,8 +29,8 @@ class LLMCapabilities:
         return tuple(capability for capability in required if not self.supports(capability))
 
 
-# The terminology contract calls this an LLM Capability. This alias keeps the
-# metadata name discoverable without introducing a second representation.
+# 术语契约称其为 LLM Capability。此别名让该元数据名称可被检索，
+# 同时不引入第二种表示。
 CapabilityMetadata = LLMCapabilities
 
 
@@ -53,7 +53,7 @@ class LLMProvider(GeneralLLM, Protocol):
 
 
 class CapabilityResolver:
-    """Resolves and checks project-owned capability metadata at workflow boundaries."""
+    """在工作流边界处解析并校验项目自有的 capability 元数据。"""
 
     @staticmethod
     def for_provider(provider: object) -> LLMCapabilities:
@@ -71,7 +71,7 @@ class CapabilityResolver:
 
 
 def provider_capabilities(provider: object) -> LLMCapabilities:
-    """Compatibility helper for Graph/Application code at an adapter boundary."""
+    """供 Graph/Application 在适配器边界使用的兼容辅助函数。"""
 
     return CapabilityResolver.for_provider(provider)
 
@@ -79,7 +79,7 @@ def provider_capabilities(provider: object) -> LLMCapabilities:
 class MockGeneralLLM:
     provider_name = "mock"
     model = "mock-general"
-    # The mock stands in for the complete-capability remote profile in tests.
+    # 该 mock 在测试中充当具备完整 capability 的远程档位。
     capabilities = LLMCapabilities(streaming=True, structured_output=True, tool_calling=True)
 
     def generate(self, user_input: str, state: GraphState) -> str:
@@ -87,7 +87,7 @@ class MockGeneralLLM:
 
 
 class RemoteOpenAICompatibleLLM:
-    """Small OpenAI-compatible adapter using the already-approved HTTPX dependency."""
+    """使用已批准的 HTTPX 依赖实现的小型 OpenAI 兼容适配器。"""
 
     provider_name = "remote"
     capabilities = LLMCapabilities(streaming=True, structured_output=True, tool_calling=True)
@@ -158,17 +158,16 @@ class LocalOpenAICompatibleLLM(RemoteOpenAICompatibleLLM):
         self.capabilities = capabilities
 
     def generate(self, user_input: str, state: GraphState) -> str:
-        # Local OpenAI-compatible servers commonly run without authentication.
+        # 本地 OpenAI 兼容服务器通常无需认证即可运行。
         return self._generate_request(user_input, require_api_key=False)
 
 
 class ExtractiveGroundedLLM:
-    """Offline development/verification reader that can only quote supplied context.
+    """只能引用所提供上下文的离线开发/验收 reader。
 
-    It is explicitly opt-in (``LLM_PROVIDER=extractive``) and used for local Demo and
-    acceptance runs where no provider credential is available. Because it extracts
-    sentences from the prompt's authorized context, it can never introduce enterprise
-    facts from pretrained knowledge. It does not support tool calling.
+    它是显式 opt-in（``LLM_PROVIDER=extractive``），用于没有 provider 凭据的本地 Demo
+    与验收运行。由于它只从提示中已授权的上下文里抽取句子，绝不会把预训练知识中的企业
+    事实引入答案。它不支持 tool calling。
     """
 
     provider_name = "extractive"
@@ -196,7 +195,7 @@ class ExtractiveGroundedLLM:
         )
         selected = [sentence for score, sentence in scored[:3] if score > 0]
         if not selected:
-            # No sentence in the authorized context relates to the question.
+            # 已授权上下文中没有任何句子与问题相关。
             return "insufficient evidence"
         return " ".join(selected)[:2000]
 
@@ -262,7 +261,7 @@ def _sentences(text: str) -> list[str]:
 
 
 def create_llm_provider(settings: Settings) -> LLMProvider:
-    """Build the configured adapter without connecting to it during startup."""
+    """构建配置指定的适配器，且启动时不与之建立连接。"""
 
     api_key = settings.llm_api_key.get_secret_value()
     if settings.llm_provider == "mock":

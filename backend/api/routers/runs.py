@@ -1,4 +1,4 @@
-"""Chat, Agent Run, and SSE streaming endpoints (API-004 / API-005)."""
+"""Chat、Agent Run 与 SSE 流式端点（API-004 / API-005）。"""
 
 from __future__ import annotations
 
@@ -88,6 +88,7 @@ async def stream_run_events(
 ) -> StreamingResponse:
     run = container.runs.resolve_run(user_id=user.user_id, run_id=run_id)
     events = container.events
+    # Last-Event-ID 超出保留的事件窗口时无法补发历史，按 409 语义要求客户端重新连接。
     try:
         history = events.history(run_id=run_id, after_event_id=last_event_id)
     except RunStreamNotFound:
@@ -96,6 +97,7 @@ async def stream_run_events(
         ) from None
 
     async def event_stream() -> AsyncIterator[bytes]:
+        # 先补发历史事件再订阅实时事件；终态 Run 无需订阅，避免挂起空闲连接。
         for envelope in history:
             yield envelope.to_sse().encode("utf-8")
         if run.status in {"completed", "rejected", "failed", "expired", "handoff_complete"}:
@@ -113,15 +115,13 @@ async def stream_run_events(
                     if subscription.closed:
                         return
                     if _is_waiting_for_approval(container, run_id):
-                        # Waiting for a human decision. That is a pause, not business
-                        # completion, and the client is not held on an idle stream.
+                        # 等待人工决策属于暂停而非业务完成；此时不把客户端挂在空闲流上。
                         return
                     yield b": keep-alive\n\n"
                     continue
                 yield envelope.to_sse().encode("utf-8")
                 if envelope.event_type == "approval_required":
-                    # The pause point is delivered; the client listens to the successor
-                    # stream after the decision.
+                    # 暂停点已送达；决策后客户端改为监听后继 Run 的流。
                     return
         finally:
             subscription.close()
@@ -138,7 +138,7 @@ async def stream_run_events(
 
 
 def _is_waiting_for_approval(container: Container, run_id: str) -> bool:
-    """True when the Run is paused for a human decision rather than still executing."""
+    """Run 处于等待人工决策（而非仍在执行）时返回 True。"""
 
     run = container.runtime.runs.get(run_id)
     return bool(run and run.status == "awaiting_approval")

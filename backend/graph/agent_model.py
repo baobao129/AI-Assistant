@@ -1,8 +1,8 @@
-"""Structured Data SQL Agent model boundary (Graph-005).
+"""Structured Data SQL Agent 的模型边界（Graph-005）。
 
-``model_node`` proposes Tool Calls or a final answer. Capability, budgets, the Tool
-Registry, and the Answer Validation step remain outside this module. Provider SDK
-types never appear here; only project-owned records cross the boundary.
+``model_node`` 提出 Tool Call 或最终答案。能力判断、预算、Tool Registry 与 Answer
+Validation 步骤都在本模块之外。Provider SDK 类型绝不出现于此；跨边界的只有项目自有
+的记录类型。
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class ToolDescriptor:
 
 
 def describe_tools(settings: Settings, tool_ids: tuple[str, ...]) -> tuple[ToolDescriptor, ...]:
-    """Bounded Tool descriptions used for structured prompting; never raw SDK schemas."""
+    """用于结构化提示的有界 Tool 描述；绝不使用原始 SDK schema。"""
 
     tables = ", ".join(settings.allowed_table_names)
     catalog: dict[str, ToolDescriptor] = {
@@ -121,10 +121,10 @@ def describe_tools(settings: Settings, tool_ids: tuple[str, ...]) -> tuple[ToolD
 
 
 def _bound_query_result_id(state: GraphState) -> str | None:
-    """The immutable Query Result Snapshot bound by an approved export proposal.
+    """已批准 export 提案所绑定的不可变 Query Result Snapshot。
 
-    Resuming a HITL flow must reuse the approved snapshot, so the Structured Data
-    model is told about it instead of querying again.
+    续接（Resume）HITL 流程必须复用已批准的 snapshot，因此要告知 Structured Data
+    模型该 snapshot，而不是重新查询。
     """
 
     if state.get("interrupt_status") != "approved":
@@ -182,7 +182,7 @@ def _bounded(value: Any, limit: int = 4000) -> str:
 
 
 class LLMSQLAgentModel:
-    """OpenAI-compatible tool-calling adapter owned by the project, not by a Provider SDK."""
+    """OpenAI 兼容的 tool-calling 适配器，归项目所有，而非某个 Provider SDK。"""
 
     def __init__(self, *, provider: Any, settings: Settings) -> None:
         self.provider = provider
@@ -196,6 +196,8 @@ class LLMSQLAgentModel:
         tool_results: list[dict[str, Any]],
         remaining_iterations: int,
     ) -> AgentDecision:
+        # 能力按需独立判断：tool_calling 与 streaming、structured_output 互不替代，
+        # 因此这里单独要求 tool_calling。
         try:
             CapabilityResolver.require(self.provider, "tool_calling")
         except UnsupportedCapabilityError:
@@ -303,10 +305,9 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 
 
 class ScriptedSQLAgentModel:
-    """Deterministic model for tests and offline smoke runs.
+    """用于测试与离线 smoke 运行的确定性模型。
 
-    It never invents data: it asks for schema or a bounded query and then reports
-    the received Tool Results.
+    它绝不编造数据：先请求 schema 或有界查询，然后汇报收到的 Tool Result。
     """
 
     def decide(
@@ -317,6 +318,8 @@ class ScriptedSQLAgentModel:
         tool_results: list[dict[str, Any]],
         remaining_iterations: int,
     ) -> AgentDecision:
+        # 分支顺序：先消费 Resume 已绑定的 snapshot，再判断是否需要 export，
+        # 最后处理首次的 schema/query 决策与对已有 Tool Result 的汇总。
         if remaining_iterations <= 0:
             return AgentDecision(
                 answer="The Structured Data agent reached its Tool iteration limit."
@@ -324,7 +327,7 @@ class ScriptedSQLAgentModel:
         lowered = state["user_input"].casefold()
         bound_query_result_id = _bound_query_result_id(state)
         if bound_query_result_id and "data_export" in tool_ids and not tool_results:
-            # Resume path: the approved proposal already bound the snapshot.
+            # Resume 路径：已批准的提案早已绑定好 snapshot。
             return AgentDecision(
                 tool_calls=(
                     ToolCallProposal(
@@ -407,7 +410,7 @@ class ScriptedSQLAgentModel:
                 )
             error = (last.get("error") or {}).get("code")
             if error == "approval_required":
-                # The Run pauses for the approval decision; the successor Run resumes here.
+                # Run 在此暂停等待审批决定；后续的 successor Run 从此处续接。
                 return AgentDecision(
                     answer="Export approval is required before the file can be produced."
                 )
@@ -428,12 +431,11 @@ class ScriptedSQLAgentModel:
 
 
 def create_sql_agent_model(provider: Any, settings: Settings) -> SQLAgentModel:
-    """Select the Structured Data Agent model.
+    """选择 Structured Data Agent 模型。
 
-    ``sql_agent_provider`` defaults to ``auto``: the deterministic scripted model runs
-    for the offline development LLM profiles, and the LLM tool-calling model runs for
-    the remote/local profiles. ``llm`` forces the LLM model even when the provider
-    lacks tool calling, which then fails safely with ``unsupported_capability``.
+    ``sql_agent_provider`` 默认为 ``auto``：离线开发 LLM 配置使用确定性的脚本化模型，
+    远程/本地配置使用 LLM tool-calling 模型。``llm`` 会强制使用 LLM 模型，即使该
+    provider 不支持 tool calling，此时会以 ``unsupported_capability`` 安全失败。
     """
 
     mode = getattr(settings, "sql_agent_provider", "auto")

@@ -1,4 +1,4 @@
-"""Conversation, thread, message, run, and event persistence."""
+"""Conversation、thread、message、run 与 event 的持久化。"""
 
 from __future__ import annotations
 
@@ -79,6 +79,7 @@ class RunRecord:
 
 
 def _cursor_from(value: datetime) -> str:
+    # 分页 cursor 编码为微秒级时间戳字符串：与 SQL 的排序键一致，且不暴露内部 ID。
     return f"{int(value.timestamp() * 1_000_000)}"
 
 
@@ -142,7 +143,7 @@ class ConversationRepository:
             (utc_now(), conversation_id),
         )
 
-    # Messages --------------------------------------------------------------
+    # Message --------------------------------------------------------------
     def add_message(
         self,
         *,
@@ -347,7 +348,7 @@ class RunRepository:
 
 
 class RunEventRepository:
-    """Replay store for SSE events; Conversation Persistence is not the replay store."""
+    """SSE 事件的 replay 存储；Conversation Persistence 不是 replay 存储。"""
 
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool
@@ -362,11 +363,10 @@ class RunEventRepository:
         payload: dict[str, Any],
         created_at: datetime | None = None,
     ) -> int:
-        """Atomically reserve the next per-Run sequence and persist the event.
+        """以原子方式预留该 Run 的下一个 sequence 并持久化事件。
 
-        The Run row is locked for the duration, so concurrent publishers (for example a
-        successor Run starting while its predecessor is still finalizing) can never be
-        assigned the same ``sequence``.
+        全程锁住 Run 行，因此并发的发布者（例如前驱 Run 尚未收尾时启动的后继 Run）
+        绝不会被分配到相同的 ``sequence``。
         """
 
         with self.pool.connection() as connection:
@@ -433,7 +433,7 @@ class RunEventRepository:
         return int(row[0]) if row and row[0] is not None else 0
 
     def trim(self, *, run_id: str, keep: int) -> int:
-        """Retain only the newest ``keep`` events for a run; replay beyond that returns 409."""
+        """每个 run 仅保留最新的 ``keep`` 条事件；超出范围的 replay 返回 409。"""
 
         row = self.pool.query_one(
             "SELECT sequence FROM run_events WHERE run_id = %s "

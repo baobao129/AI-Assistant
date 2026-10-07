@@ -1,4 +1,4 @@
-"""Persistence adapters. Domain and Application layers depend on these boundaries, not on SQL."""
+"""持久化适配器。Domain 与 Application 层依赖这些边界，而不是依赖 SQL。"""
 
 from backend.infrastructure.repositories.approvals import ApprovalRecord, ApprovalRepository
 from backend.infrastructure.repositories.auth import AuthRepository

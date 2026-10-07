@@ -1,7 +1,7 @@
-"""Contract Tool implementations: knowledge_search, database_schema, database_query, data_export.
+"""Contract Tool 实现：knowledge_search、database_schema、database_query、data_export。
 
-Every Tool receives explicit input and returns a normalized Tool Result. Tools never
-read or mutate Graph State, Conversation Persistence, or Checkpoint.
+每个 Tool 接收显式输入并返回规范化的 Tool Result。Tool 从不读取或修改
+Graph State、Conversation Persistence 或 Checkpoint。
 """
 
 from __future__ import annotations
@@ -73,12 +73,12 @@ class DataExportInput(BaseModel):
 
 
 class KnowledgeSearchTool(RegisteredTool):
-    """Dense retrieval over Child Chunks with Parent mapping handled by the Graph."""
+    """在 Child Chunk 上的稠密检索，Parent 映射交由 Graph 处理。"""
 
     metadata = ToolMetadata("knowledge_search", "1", "low", "knowledge_retrieval")
     input_model = KnowledgeSearchInput
 
-    # Bounded retrieval windows: `knowledge_search` is never an unbounded scan.
+    # 有界的检索窗口：`knowledge_search` 永远不会是一次无界扫描。
     RETRIEVAL_CANDIDATE_FACTOR = 4
     MAX_RETRIEVAL_CANDIDATES = 200
     MAX_DOCUMENT_SCOPE = 50
@@ -128,8 +128,8 @@ class KnowledgeSearchTool(RegisteredTool):
                 )
             targets = [(version.index_version, version.collection_name or default_collection)]
         else:
-            # Each authorized Document is searched through its own active version, which
-            # keeps the query bounded and avoids one wide `document_id IN (...)` filter.
+            # 每个已授权 Document 都通过自身的 active 版本分别检索，使查询保持有界，
+            # 并避免使用一个宽泛的 `document_id IN (...)` 过滤条件。
             targets = []
             for document in documents[: self.MAX_DOCUMENT_SCOPE]:
                 if not document.active_index_version:
@@ -163,8 +163,8 @@ class KnowledgeSearchTool(RegisteredTool):
         merged: dict[str, float] = {}
         for group in groups:
             for match in group:
-                # Authorization is enforced on the returned rows as well as by the
-                # server-resolved scope, so no result can escape it.
+                # 除了服务端解析出的作用域外，返回的行上也会强制授权，
+                # 因此没有结果能逃逸该授权。
                 if not match.document_id or match.document_id not in allowed_ids:
                     continue
                 if match.score > merged.get(match.chunk_id, float("-inf")):
@@ -194,12 +194,11 @@ class KnowledgeSearchTool(RegisteredTool):
         )
 
     def _search(self, *, collection: str, embedding: list[float], top_k: int, index_version: str):
-        """Bounded vector search scoped by index version.
+        """按 index version 限定范围的有界向量检索。
 
-        Milvus is not asked for a large ``document_id IN (...)`` expression: that
-        composite filter can under-recall on this runtime, so the query is scoped by
-        index version and authorization is enforced on the returned rows instead.
-        The candidate window stays bounded.
+        不向 Milvus 请求大型 ``document_id IN (...)`` 表达式：该复合过滤在本运行时
+        可能召回不足，因此改为按 index version 限定查询，并在返回行上强制授权。
+        候选窗口保持有界。
         """
 
         window = max(top_k, self.settings.max_retrieval_top_k) * self.RETRIEVAL_CANDIDATE_FACTOR
@@ -213,10 +212,10 @@ class KnowledgeSearchTool(RegisteredTool):
     def _authorized_documents(
         self, arguments: KnowledgeSearchInput, context: ToolExecutionContext | None
     ):
-        """Resolve candidate Documents inside the server-side authorization scope.
+        """在服务端授权范围内解析候选 Document。
 
-        The caller scope is authoritative. Requested `document_ids` may only narrow
-        it; a request for a document outside the scope returns no evidence.
+        调用方的作用域是权威来源。请求的 `document_ids` 只能将其收窄；
+        对范围之外的 Document 请求将不返回任何证据。
         """
 
         scope = set(context.authorized_document_ids) if context else set()
@@ -283,7 +282,7 @@ class KnowledgeSearchTool(RegisteredTool):
 
 
 class DatabaseSchemaTool(RegisteredTool):
-    """Allowlisted schema discovery from the read-only account; no system catalogs."""
+    """从 read-only 账号进行白名单 schema 发现；不访问系统目录。"""
 
     metadata = ToolMetadata("database_schema", "1", "low", "structured_schema")
     input_model = DatabaseSchemaInput
@@ -375,7 +374,7 @@ class DatabaseSchemaTool(RegisteredTool):
 
 
 class DatabaseQueryTool(RegisteredTool):
-    """`database_query`: Tool input validation -> SQL Validator -> read-only database."""
+    """`database_query`：Tool 输入校验 -> SQL Validator -> read-only 数据库。"""
 
     metadata = ToolMetadata("database_query", "1", "medium", "structured_query")
     input_model = DatabaseQueryInput
@@ -402,7 +401,7 @@ class DatabaseQueryTool(RegisteredTool):
         started = time.monotonic()
         validation = self._validate(arguments.sql)
         if not validation.accepted:
-            # Security and policy rejections are terminal for this call and never retried.
+            # 安全与策略拒绝对本调用是终态的，绝不会重试。
             return ToolResult(
                 tool_id=self.metadata.tool_id,
                 tool_call_id=tool_call_id,
@@ -415,7 +414,7 @@ class DatabaseQueryTool(RegisteredTool):
             )
         max_rows = min(arguments.max_rows, self.settings.sql_max_rows)
         try:
-            # One extra row is read only so truncation is detected from the result set.
+            # 仅多读一行，以便从结果集判断是否发生了截断。
             outcome = self.query_runner.run(
                 arguments.sql, arguments.parameters, max_rows=max_rows + 1
             )
@@ -446,6 +445,7 @@ class DatabaseQueryTool(RegisteredTool):
                 metadata={"sql_validation": "accepted"},
             )
 
+        # 掩码与截断：敏感列替换为固定掩码，其余值做长度截断，避免泄露原始数据。
         masked_columns = [
             index
             for index, column in enumerate(outcome.columns)
@@ -496,7 +496,7 @@ class DatabaseQueryTool(RegisteredTool):
 
 
 class DataExportTool(RegisteredTool):
-    """High-risk Tool. Proposal creates the Approval Request; execution needs an approved one."""
+    """高风险 Tool。提案会创建 Approval Request；执行需要已批准的请求。"""
 
     metadata = ToolMetadata("data_export", "1", "high", "controlled_export")
     input_model = DataExportInput
@@ -524,8 +524,8 @@ class DataExportTool(RegisteredTool):
         approval_request_id = scope.approval_request_id
         user_id = scope.user_id
         if scope.query_result_id:
-            # The approved proposal bound one immutable snapshot; a resume cannot
-            # substitute a newer query result for it.
+            # 已批准的提案绑定了一个不可变快照；恢复执行不能用一个更新的
+            # 查询结果将其替换。
             if arguments.query_result_id != scope.query_result_id:
                 return self._rejected(
                     tool_call_id,
@@ -550,8 +550,8 @@ class DataExportTool(RegisteredTool):
                 "query_result_not_found",
                 "The referenced query result is unavailable.",
             )
-        # A snapshot is only usable by the scope that produced it. A snapshot written
-        # without an owner (for example a direct Tool call) is not transferable.
+        # 快照只能由产生它的作用域使用。未写入所有者（例如直接调用 Tool）
+        # 的快照不可转移。
         if query_result.user_id != (user_id or ""):
             return self._rejected(
                 tool_call_id,
@@ -582,6 +582,7 @@ class DataExportTool(RegisteredTool):
             )
 
         if approval_request_id is None:
+            # 审批绑定不可变快照与过期时间；过期后不能用于恢复原始执行。
             approval = self.approvals.create(
                 run_id=scope.run_id or "",
                 thread_id=scope.thread_id or "",
@@ -641,6 +642,7 @@ class DataExportTool(RegisteredTool):
                 "The approval does not match this export.",
             )
 
+        # 幂等产物：审批请求已有产物时直接返回，重复决策不会生成第二个导出。
         existing = self.artifacts.get_by_approval(approval.approval_request_id)
         if existing is not None:
             return self._completed(tool_call_id, approval, existing.artifact_id, existing.row_count)

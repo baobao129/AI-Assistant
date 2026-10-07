@@ -1,4 +1,4 @@
-"""Approval Request persistence for the HITL boundary (ADR-013)."""
+"""HITL 边界的 Approval Request 持久化（ADR-013）。"""
 
 from __future__ import annotations
 
@@ -121,10 +121,9 @@ class ApprovalRepository:
         decided_by: str,
         successor_run_id: str | None = None,
     ) -> bool:
-        """Idempotent transition from ``pending`` to a terminal decision.
+        """从 ``pending`` 到终态决策的幂等转换。
 
-        Returns ``True`` when this call performed the transition. A repeated
-        decision returns ``False`` and never creates a second side effect.
+        本次调用完成了转换时返回 ``True``；重复决策返回 ``False``，且绝不产生第二次副作用。
         """
 
         affected = self.pool.execute(

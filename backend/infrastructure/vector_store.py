@@ -1,7 +1,7 @@
-"""Vector Store adapter: Milvus Standalone holds Child Chunk vectors (ADR-006/ADR-012).
+"""Vector Store 适配器：Milvus Standalone 保存 Child Chunk 向量（ADR-006/ADR-012）。
 
-Milvus is the vector execution store. Active index-version authority lives in the
-application registry; this adapter never decides what is active.
+Milvus 是向量执行存储。活跃的 index-version 权威在应用 registry 中；本适配器绝不判定
+哪个版本是活跃的。
 """
 
 from __future__ import annotations
@@ -16,11 +16,12 @@ from backend.infrastructure.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# content/label/location 等仅作元数据预览写入 Milvus；写入前截断以适配 VARCHAR 列宽。
 CONTENT_PREVIEW_CHARS = 2000
 
 
 class VectorStoreError(RuntimeError):
-    """Milvus could not complete the requested vector operation."""
+    """Milvus 无法完成所请求的向量操作。"""
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ class MilvusVectorStore:
     def upsert(self, *, collection: str, records: list[VectorRecord]) -> int:
         if not records:
             return 0
+        # 仅写入元数据预览：content/label/location 均按 Milvus VARCHAR 列宽截断。
         rows = [
             {
                 "chunk_id": record.chunk_id,
@@ -207,8 +209,10 @@ class MilvusVectorStore:
 
 
 def collection_name(*, provider: str, model: str, dimension: int) -> str:
-    """Collection identity tied to embedding model and dimension (PROJECT_SPEC §8)."""
+    """collection 标识与 embedding model 和维度绑定（PROJECT_SPEC §8）。"""
 
+    # 命名规则：knowledge_<provider>_<model>_<dimension>；非字母数字字符替换为下划线，
+    # 并截断到 120 字符以内，避免超出 Milvus collection 名称上限。
     safe_model = "".join(character if character.isalnum() else "_" for character in model)
     return f"knowledge_{provider}_{safe_model}_{dimension}"[:120]
 

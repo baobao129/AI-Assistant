@@ -1,4 +1,4 @@
-"""Conversation and Message endpoints (API-003)."""
+"""Conversation 与 Message 端点（API-003）。"""
 
 from __future__ import annotations
 

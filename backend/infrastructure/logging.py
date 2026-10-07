@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 class ProjectFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        # Only fixed event names and allowlisted correlation fields enter project logs.
+        # 只有固定的事件名与白名单内的关联字段才进入项目日志。
         payload = {
             "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,

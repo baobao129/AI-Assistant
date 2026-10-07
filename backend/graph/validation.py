@@ -1,9 +1,8 @@
-"""Intent-aware Answer Validation (Graph-008).
+"""意图感知的 Answer Validation（Graph-008）。
 
-Validation runs after path execution and before ``response_finalize`` commits a
-terminal response. Deterministic safe Routing Outcomes bypass Intent-aware
-validation. Revision is bounded by ``max_answer_revisions`` for one answer
-candidate and never becomes an unbounded self-loop.
+Validation 在路径执行之后、``response_finalize`` 提交终态响应之前运行。确定性的安全
+Routing Outcome 会跳过意图感知的校验。Revision 对单个答案候选受 ``max_answer_revisions``
+约束，绝不会变成无界的自循环。
 """
 
 from __future__ import annotations
@@ -34,14 +33,14 @@ class AnswerValidator(Protocol):
 def validate_answer(
     state: GraphState, budgets: ExecutionBudgets | None = None
 ) -> dict[str, object]:
-    # The revision budget is consulted by the Graph routing predicate, not here.
+    # revision 预算由 Graph 路由谓词读取，此处不消费。
     del budgets
     intent = state.get("intent")
     candidate = (state.get("answer_candidate") or "").strip()
     revisions = int(state.get("answer_revision_count") or 0)
 
     if state.get("routing_outcome") not in (None, "routed"):
-        # Deterministic safe outcomes are valid validation exceptions.
+        # 确定性的安全终态是校验的合法例外，直接视为 validated。
         return {"answer_validation": {"status": "validated", "reasons": ["safe_routing_outcome"]}}
 
     if not candidate:
@@ -61,6 +60,8 @@ def validate_answer(
 
 
 def _validate_knowledge(state: GraphState, candidate: str, revisions: int) -> dict[str, object]:
+    # 知识路径缺少已授权证据时返回 insufficient_evidence 安全终态，绝不使用
+    # 预训练知识填补企业事实。
     results = state.get("retrieval_results") or []
     if not results:
         return _outcome("insufficient_evidence", ["no_authorized_evidence"], revisions)
@@ -113,7 +114,7 @@ def _outcome(status: ValidationStatus, reasons: list[str], revisions: int) -> di
 
 
 def _has_grounding(candidate: str, results: list[dict[str, object]]) -> bool:
-    """A knowledge answer must overlap its retrieved evidence or cite a source label."""
+    """知识类回答必须与其召回证据重叠，或引用某个来源标签。"""
 
     lowered = candidate.casefold()
     for item in results:
@@ -137,7 +138,7 @@ def _mentions_result_evidence(candidate: str, results: list[dict[str, object]]) 
         for token in _significant_tokens(str(data.get("query_summary") or ""))[:20]:
             if token in lowered:
                 return True
-    # A short factual summary that names a returned column is acceptable evidence use.
+    # 简短的事实性总结只要点出返回的列名，即视为合理使用了证据。
     for result in results:
         for column in (result.get("data") or {}).get("columns") or []:
             if str(column).casefold() in lowered:
@@ -152,7 +153,7 @@ def _significant_tokens(text: str) -> list[str]:
 
 
 def should_revise(state: GraphState, budgets: ExecutionBudgets) -> bool:
-    """Revision is eligible only for a retryable failure within the candidate budget."""
+    """仅当出现可重试的失败且仍在候选级预算内时，才允许 revision。"""
 
     validation = state.get("answer_validation") or {}
     if validation.get("status") != "retryable_validation_failure":
@@ -164,7 +165,7 @@ def should_revise(state: GraphState, budgets: ExecutionBudgets) -> bool:
 
 
 def revision_update(state: GraphState) -> dict[str, object]:
-    """Increments the candidate-local revision counter and clears the candidate."""
+    """递增候选级的 revision 计数器并清空当前候选答案。"""
 
     return {
         "answer_revision_count": int(state.get("answer_revision_count") or 0) + 1,

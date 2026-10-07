@@ -1,5 +1,5 @@
-"""FastAPI application factory: health, authentication, Conversation, Run, SSE, Approval,
-Document, Ingestion, and Structured Data APIs (``docs/contracts/API_CONTRACT.md``).
+"""FastAPI 应用工厂：health、authentication、Conversation、Run、SSE、Approval、
+Document、Ingestion 与 Structured Data API（``docs/contracts/API_CONTRACT.md``）。
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # 应用启动时装配 Container 并拉起后台 maintenance（负责陈旧 Job 恢复等）。
         active = container or build_container(config)
         app.state.container = active
         app.state.dispatcher = RunDispatcher(container=active)
@@ -82,6 +83,7 @@ def create_app(
 
     @app.middleware("http")
     async def correlate(request: Request, call_next):
+        # 仅接受格式合法的外部 Request ID，否则生成新的，避免日志与响应头被注入。
         proposed = request.headers.get("X-Request-ID", "")
         request.state.request_id = (
             proposed if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", proposed) else uuid4().hex
@@ -90,6 +92,7 @@ def create_app(
             response = await call_next(request)
         except AppError as error:
             response = error_response(request, error.status_code, error.code, error.message)
+        # 未预期异常统一映射为安全的 internal_error，原始异常细节绝不返回给调用方。
         except Exception:
             logger.error("request_failed", extra={"request_id": request.state.request_id})
             response = error_response(request, 500, "internal_error", "Request could not complete.")

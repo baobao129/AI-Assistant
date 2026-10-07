@@ -1,4 +1,4 @@
-"""Application API schemas. Request, domain, and infrastructure shapes stay separate."""
+"""应用 API schemas。请求、domain 与 infrastructure 的结构保持分离。"""
 
 from __future__ import annotations
 

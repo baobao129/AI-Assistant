@@ -1,4 +1,4 @@
-"""API dependencies: runtime container, dispatcher, and bearer authentication."""
+"""API 依赖项：运行时 Container、dispatcher 与 bearer 认证。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Container:
-    """Process-wide composition: runtime, services, checkpointer, and workers."""
+    """进程级装配：运行时、各服务、checkpointer 与 workers。"""
 
     settings: Settings
     runtime: Runtime
@@ -54,6 +54,7 @@ def build_tool_registry(runtime: Runtime):
     )
     from backend.tools.registry import ToolRegistry
 
+    # 所有 Agent 工具只能经 Tool Registry / Tool Executor 调用，此处集中装配工具集。
     return ToolRegistry(
         [
             KnowledgeSearchTool(
@@ -82,9 +83,11 @@ def build_tool_registry(runtime: Runtime):
 
 
 def build_container(settings: Settings) -> Container:
+    # 启动时先恢复陈旧的 ingestion Job，再把各适配器与服务组装进 Container。
     runtime = build_runtime(settings)
     runtime.ingestion.recover_stale_jobs()
     tools = ToolExecutor(build_tool_registry(runtime))
+    # Checkpoint 连接需在进程存活期间保持打开，由 Container.close() 统一释放。
     checkpointer_context = open_checkpointer(
         settings.checkpoint_mode, settings.checkpoint_sqlite_path
     )
@@ -138,6 +141,7 @@ def get_current_user(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> AuthenticatedUser:
+    # 认证边界：仅接受 Bearer token，缺失或格式不符一律按未认证处理。
     if not authorization or not authorization.lower().startswith("bearer "):
         raise authentication_error()
     token = authorization.split(" ", 1)[1].strip()
@@ -152,7 +156,7 @@ def bearer_token(authorization: str | None) -> str:
 
 @dataclass
 class RunDispatcher:
-    """Bounded background execution for Agent Runs and approval successors."""
+    """Agent Run 与审批后继执行的有界后台执行器。"""
 
     container: Container
     max_concurrent: int = 4
@@ -162,6 +166,7 @@ class RunDispatcher:
         self._semaphore = threading.BoundedSemaphore(self.max_concurrent)
 
     def dispatch(self, run_id: str, *, approval_request_id: str | None = None) -> bool:
+        # 信号量限制并发执行数；容量耗尽时立即失败，由上层返回 conflict，绝不无限排队。
         if not self._semaphore.acquire(blocking=False):
             logger.warning("run_dispatcher_capacity_exhausted")
             return False

@@ -1,9 +1,9 @@
-"""Approval decisions for the HITL boundary (ADR-013 / API-006).
+"""HITL 边界的 Approval 决策（ADR-013 / API-006）。
 
-Approve preserves the interrupted Run as ``original_run_id``, marks it terminal
-``handoff_complete``, and creates a successor Run on the same Thread and Checkpoint
-lineage. Reject terminates the original Run as ``rejected`` with no successor.
-Decisions are idempotent by ``approval_request_id`` and produce no second side effect.
+Approve 会把被中断的 Run 保留为 ``original_run_id``，将其标记为终态
+``handoff_complete``，并在同一 Thread 与 Checkpoint 沿革上创建一个 successor Run。
+Reject 会以 ``rejected`` 终止原始 Run，且不创建 successor。
+决策按 ``approval_request_id`` 幂等，且不会产生第二次副作用。
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ class ApprovalService:
             "approved" if decision == "approve" else "rejected"
         )
         if approval.status == lifecycle:
-            # Repeated identical decision: same logical result, no second side effect.
+            # 重复的相同决策：返回相同的逻辑结果，不产生第二次副作用。
             return DecisionResult(
                 approval_request_id,
                 lifecycle,
@@ -96,7 +96,7 @@ class ApprovalService:
             raise not_found("The interrupted run was not found.")
 
         if decision == "reject":
-            # Rejection cannot execute the Tool; no execution successor is created.
+            # Reject 不能执行 Tool；不会创建执行 successor。
             if not self.approvals.decide(
                 approval_request_id, lifecycle="rejected", decided_by=user_id
             ):
@@ -144,9 +144,9 @@ class ApprovalService:
                 raise conflict("The approval decision could not be applied.")
             if current.successor_run_id:
                 successor = self.runs.get(current.successor_run_id) or successor
-        # Publish the original Run's terminal final event before that Run becomes
-        # terminal, so a client still attached to the waiting stream observes the
-        # handoff instead of a stream that closes without a terminal event.
+        # 先发布原始 Run 的终态 final 事件，再让它变为终态，
+        # 这样仍附着在等待流上的客户端能观察到 handoff，
+        # 而不是看到一条没有终态事件就直接关闭的流。
         self.events.publish(
             run_id=original.run_id,
             thread_id=original.thread_id,

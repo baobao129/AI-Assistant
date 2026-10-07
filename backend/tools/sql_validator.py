@@ -1,8 +1,8 @@
-"""SQL Validator: the mandatory boundary between the LLM and the read-only database.
+"""SQL Validator：LLM 与 read-only 数据库之间的强制边界。
 
-Policy source: ``docs/contracts/TOOL_CONTRACT.md`` TOOL-003 and
-``docs/contracts/GRAPH_CONTRACT.md`` Graph-005. The validator only ever reads a
-proposed statement; it never executes SQL and never touches Graph State.
+策略来源：``docs/contracts/TOOL_CONTRACT.md`` TOOL-003 与
+``docs/contracts/GRAPH_CONTRACT.md`` Graph-005。验证器只读取被提议的语句，
+从不执行 SQL，也从不接触 Graph State。
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ SQLValidationStatus = Literal["accepted", "rejected"]
 
 DIALECT = "mysql"
 
-# Statement allowlist: only plain reads may reach the database driver.
+# 语句白名单：只有纯读取语句才可能到达数据库驱动。
 ALLOWED_STATEMENTS: tuple[type[exp.Expression], ...] = (exp.Select, exp.Union)
 
-# Functions that can stall the server, read the filesystem, or escape the
-# allowlisted query scope. Names are compared case-insensitively.
+# 可能拖垮服务器、读取文件系统或逃逸白名单查询范围的函数。
+# 名称按大小写不敏感比较。
 FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset(
     {
         "sleep",
@@ -52,7 +52,7 @@ FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset(
     }
 )
 
-# Non-function nodes that always indicate a write, DDL, or file side effect.
+# 非函数节点，这些节点总是指向写入、DDL 或文件副作用。
 FORBIDDEN_NODES: tuple[type[exp.Expression], ...] = (
     exp.Insert,
     exp.Update,
@@ -69,7 +69,7 @@ FORBIDDEN_NODES: tuple[type[exp.Expression], ...] = (
     exp.Grant,
 )
 
-# A structured-data query must not read across databases or system catalogs.
+# 结构化数据查询不得跨数据库读取，也不得读取系统目录。
 FORBIDDEN_SCHEMA_PREFIXES: frozenset[str] = frozenset(
     {"information_schema", "mysql", "performance_schema", "sys"}
 )
@@ -77,14 +77,14 @@ FORBIDDEN_SCHEMA_PREFIXES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class SQLValidation:
-    """Result of one validator pass; ``reasons`` never contain SQL text or secrets."""
+    """单次验证的结果；``reasons`` 绝不含 SQL 文本或机密。"""
 
     status: SQLValidationStatus
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def reason(self) -> str | None:
-        """Primary rejection code, kept for single-reason callers."""
+        """主拒绝码，为只关心单一原因的调用方保留。"""
 
         return self.reasons[0] if self.reasons else None
 
@@ -98,7 +98,7 @@ class SQLValidator(Protocol):
 
 
 class ProjectSQLValidator:
-    """AST, allowlist, scope, complexity, and limit enforcement for one statement."""
+    """针对单条语句的 AST、白名单、作用域、复杂度与 LIMIT 约束。"""
 
     def __init__(
         self,
@@ -135,6 +135,7 @@ class ProjectSQLValidator:
         if "outfile" in lowered or "dumpfile" in lowered:
             return SQLValidation("rejected", ("file_write_blocked",))
 
+        # 先做 AST 解析：只有能解析为单条语句的语法树才继续校验。
         try:
             statements = sqlglot.parse(text, read=DIALECT)
         except ParseError:
@@ -142,6 +143,7 @@ class ProjectSQLValidator:
         except (ValueError, RecursionError):
             return SQLValidation("rejected", ("unparseable_statement",))
 
+        # 多语句阻断：任何被分号拼接的额外语句都会直接拒绝，避免绕过白名单。
         if len(statements) != 1:
             return SQLValidation("rejected", ("multi_statement_blocked",))
         statement = statements[0]
@@ -211,6 +213,7 @@ class ProjectSQLValidator:
         if score > self.max_complexity_score:
             reasons.append("complexity_limit_exceeded")
 
+        # 复杂度与 LIMIT 双约束：必须带字面量 LIMIT 且不超过 max_rows，否则拒绝。
         limit = statement.args.get("limit")
         if statement.args.get("offset") is not None:
             reasons.append("offset_not_supported")
@@ -246,7 +249,7 @@ class ProjectSQLValidator:
 
     @staticmethod
     def _has_unrestricted_projection(select: exp.Select) -> bool:
-        """True when a projection expands every column; ``COUNT(*)`` stays allowed."""
+        """当投影展开所有列时为 True；``COUNT(*)`` 仍然允许。"""
 
         for projection in select.expressions:
             target = projection.this if isinstance(projection, exp.Alias) else projection
@@ -267,7 +270,7 @@ class ProjectSQLValidator:
 
 
 def build_validator(settings: object) -> ProjectSQLValidator:
-    """Build the validator from typed settings without importing Settings at module import."""
+    """用 typed settings 构建验证器，且不在模块导入时导入 Settings。"""
 
     return ProjectSQLValidator(
         allowed_tables=tuple(getattr(settings, "allowed_table_names", ())),

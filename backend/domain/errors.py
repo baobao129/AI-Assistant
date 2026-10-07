@@ -22,11 +22,11 @@ class SafeError(BaseModel):
 
 
 class RecoverableFailure(Exception):
-    """Explicit transient failure eligible for the Graph/Application repair budget."""
+    """显式的瞬时失败，可进入 Graph/Application 的 repair 预算。"""
 
 
 class AppError(Exception):
-    """Application failure carrying a canonical code and the mapped HTTP status."""
+    """应用层失败，携带规范化的错误码与映射后的 HTTP 状态码。"""
 
     def __init__(
         self,

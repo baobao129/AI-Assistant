@@ -1,4 +1,4 @@
-"""Authentication persistence: users and bearer sessions."""
+"""认证持久化：用户与 bearer session。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ class AuthRepository:
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool
 
-    # Users -----------------------------------------------------------------
+    # 用户 -----------------------------------------------------------------
     def get_user_by_username(self, username: str) -> UserRecord | None:
         row = self.pool.query_one(
             "SELECT user_id, username, display_name, password_hash, password_salt, is_active "
@@ -52,7 +52,7 @@ class AuthRepository:
         row = self.pool.query_one("SELECT COUNT(*) FROM users")
         return int(row[0]) if row else 0
 
-    # Sessions --------------------------------------------------------------
+    # Session --------------------------------------------------------------
     def create_session(self, *, user_id: str, token: str, expires_at: datetime) -> SessionRecord:
         session_id = new_id()
         now = utc_now()

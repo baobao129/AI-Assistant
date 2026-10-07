@@ -13,7 +13,7 @@ CheckpointMode = Literal["memory", "sqlite"]
 def checkpoint_context(
     mode: CheckpointMode, sqlite_path: Path | str | None = None
 ) -> Iterator[object]:
-    """Expose approved Memory and SQLite modes without making Checkpoint a Graph Node."""
+    """提供已批准的 Memory 与 SQLite 模式，同时不把 Checkpoint 变成 Graph Node。"""
     if mode == "memory":
         yield InMemorySaver()
         return
@@ -30,7 +30,7 @@ def checkpoint_context(
 def open_checkpointer(
     mode: CheckpointMode, sqlite_path: Path | str | None = None
 ) -> Iterator[object]:
-    """Long-lived Checkpoint handle for a process; closed when the runtime stops."""
+    """进程级长期存活的 Checkpoint 句柄；运行时停止时关闭。"""
 
     with checkpoint_context(mode, sqlite_path) as saver:
         yield saver

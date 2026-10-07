@@ -1,8 +1,8 @@
-"""Background workers: ingestion execution, startup recovery, and retention cleanup.
+"""后台 worker：ingestion 执行、启动恢复与保留期清理。
 
-Ingestion uses FastAPI BackgroundTasks with a persisted Job lifecycle (ADR-009).
-Startup recovery marks stale ``running`` Jobs and orphaned ``pending`` Jobs as
-``failed``; retries stay explicit and bounded.
+Ingestion 使用 FastAPI BackgroundTasks，并配合持久化的 Job 生命周期（ADR-009）。
+启动恢复会把陈旧的 ``running`` Job 和孤立的 ``pending`` Job 标记为
+``failed``；重试始终保持显式且有界。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IngestionWorker:
-    """Runs ingestion jobs on a bounded thread pool owned by the process."""
+    """在进程自有的有界线程池上运行 ingestion job。"""
 
     runtime: Runtime
     _threads: list[threading.Thread] = field(default_factory=list)
@@ -57,7 +57,7 @@ class IngestionWorker:
 
 @dataclass
 class MaintenanceWorker:
-    """Periodic bounded maintenance: approval expiry and Query Result retention."""
+    """周期性有界维护：审批过期与 Query Result 保留期清理。"""
 
     runtime: Runtime
     interval_seconds: float = 60.0
@@ -90,7 +90,7 @@ class MaintenanceWorker:
 
 
 def recover_startup_state(runtime: Runtime) -> dict[str, int]:
-    """Run explicit bounded recovery for stale ingestion Jobs."""
+    """对陈旧的 ingestion Job 执行显式的有界恢复。"""
 
     return runtime.ingestion.recover_stale_jobs()
 

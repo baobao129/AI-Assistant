@@ -1,8 +1,8 @@
-"""Document ingestion, re-index, and deletion lifecycle (ADR-009 / ADR-019).
+"""文档摄取、重建索引与删除的生命周期（ADR-009 / ADR-019）。
 
-Ingestion runs in a background worker. Parse -> store normalized text -> Parent/Child
-chunk -> embed -> vector write -> validate -> promote. A new index version never
-replaces the active one until it has been fully validated.
+摄取在后台 worker 中运行。Parse -> 存储归一化文本 -> Parent/Child
+chunk -> embed -> 向量写入 -> validate -> promote。新的 index version 在完全
+完成校验之前，绝不替换 active 版本。
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ logger = logging.getLogger(__name__)
 
 MAX_EXTRACTED_CHARS = 400_000
 
-# Milvus becomes consistent shortly after a write; a short bounded wait keeps
-# promotion from racing vector visibility.
+# Milvus 在写入后需要短暂时间才达到一致；一段简短的、有界的等待可避免
+# promote 与向量可见性发生竞争。
 VECTOR_VISIBILITY_SECONDS = 2.0
 
 
@@ -86,7 +86,7 @@ class IngestionService:
         self.embeddings = embeddings
         self.vectors = vectors
 
-    # Submission ------------------------------------------------------------
+    # 提交 ------------------------------------------------------------
     def submit_upload(
         self,
         *,
@@ -118,9 +118,9 @@ class IngestionService:
                         prior_job.status,
                         True,
                     )
-            # The Document already exists for this content fingerprint. A duplicate
-            # submission is answered from existing state: no second Document, no second
-            # index version, and no never-promoted version record.
+            # 该内容指纹对应的 Document 已存在。重复提交直接由既有状态应答：
+            # 不创建第二个 Document、不创建第二个 index version，
+            # 也不生成一个从未 promote 的 version 记录。
             return UploadOutcome(
                 existing.document_id,
                 "",
@@ -173,7 +173,7 @@ class IngestionService:
         document = self.documents.get(document_id, user_id=user_id)
         if document is None or document.status != "available":
             raise not_found("Document was not found.")
-        # Mark unavailable before cleanup so promotion cannot reactivate it.
+        # 在清理之前先标记为不可用，这样 promote 就无法将其重新激活。
         self.documents.mark_deleted(document_id, user_id=user_id)
         version = self._create_version(document_id)
         job = self.jobs.create(
@@ -214,13 +214,13 @@ class IngestionService:
             raise not_found("Ingestion job was not found.")
         return job
 
-    # Worker ----------------------------------------------------------------
+    # Worker 处理 ----------------------------------------------------------------
     def process_job(self, ingestion_job_id: str, *, payload: bytes | None = None) -> str:
         job = self.jobs.get(ingestion_job_id)
         if job is None:
             return JOB_STATUS_FAILED
         if not self.jobs.claim(ingestion_job_id):
-            # Another worker already claimed it; claiming is idempotent.
+            # 已有其他 worker 抢先 claim；claim 操作是幂等的。
             current = self.jobs.get(ingestion_job_id)
             return current.status if current else JOB_STATUS_FAILED
         if job.job_type == "delete":
@@ -251,7 +251,7 @@ class IngestionService:
         logger.info("ingestion_succeeded chunks=%s", chunk_count)
         return JOB_STATUS_SUCCESS
 
-    # Internals -------------------------------------------------------------
+    # 内部实现 -------------------------------------------------------------
     def _create_version(self, document_id: str):
         provider = self.embeddings.provider_name
         model = self.embeddings.model
@@ -267,8 +267,8 @@ class IngestionService:
 
     def _extract_text(self, job: IngestionJobRecord, payload: bytes | None) -> str:
         if payload is None:
-            # Re-index, a retried Job, and any Job resumed without the original bytes use
-            # the normalized text captured at first ingestion.
+            # 重建索引、重试的 Job，以及任何在缺少原始字节情况下恢复的 Job，
+            # 都使用首次摄取时捕获的归一化文本。
             stored = self.contents.get(job.document_id)
             if stored is None:
                 raise _IngestionFailure("content_unavailable", "Stored document text is missing.")
@@ -370,8 +370,8 @@ class IngestionService:
                     for record, vector in zip(child_records, vectors, strict=True)
                 ],
             )
-            # Vector visibility is not instantaneous, so the verification below must
-            # not race the write; the version is not promoted on unverified vectors.
+            # 向量可见性并非瞬时，因此下面的校验不能与写入竞争；
+            # 未通过校验的向量不会被 promote。
             time.sleep(VECTOR_VISIBILITY_SECONDS)
             self._verify_vectors(
                 collection=collection, index_version=index_version, expected=len(child_records)
@@ -387,7 +387,7 @@ class IngestionService:
         return len(child_records)
 
     def _verify_vectors(self, *, collection: str, index_version: str, expected: int) -> None:
-        """A new index version is promoted only after its vectors are verifiable."""
+        """只有在向量的可校验性得到确认之后，新的 index version 才会被 promote。"""
 
         if expected <= 0:
             return
@@ -431,8 +431,8 @@ class IngestionService:
         try:
             self.vectors.delete_version(collection=collection, index_version=index_version)
         except VectorStoreError:
-            # The Document is already unavailable, so a cleanup failure is reported,
-            # never silently treated as a completed delete.
+            # Document 已处于不可用状态，因此清理失败会被上报，
+            # 绝不静默当作删除已完成。
             raise
 
     def recover_stale_jobs(self) -> dict[str, int]:

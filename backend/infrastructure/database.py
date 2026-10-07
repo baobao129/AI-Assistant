@@ -1,11 +1,10 @@
-"""Blocking MySQL access for the application and the read-only SQL Agent path.
+"""面向应用与只读 SQL Agent 路径的阻塞式 MySQL 访问。
 
-Two engines exist by design (``docs/contracts/TOOL_CONTRACT.md`` TOOL-003 and
-``AGENTS.md`` SQL Security Rules):
+按设计存在两个 engine（见 ``docs/contracts/TOOL_CONTRACT.md`` 的 TOOL-003 与
+``AGENTS.md`` 的 SQL Security Rules）：
 
-* the application engine uses the configured application account for business tables;
-* the read-only engine uses the configured read-only account and only executes
-  validated, parameterized reads.
+* 应用 engine 使用配置的应用账号访问业务表；
+* 只读 engine 使用配置的只读账号，仅执行已校验、参数化的读取。
 """
 
 from __future__ import annotations
@@ -25,30 +24,28 @@ from backend.infrastructure.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Driver and server error codes that mean "the statement did not finish in time".
-# 1205 lock wait timeout, 1317 query interrupted, 2013 socket read timeout,
-# 3024 max execution time exceeded.
+# 表示「语句未在时限内完成」的驱动与服务器错误码：
+# 1205 锁等待超时、1317 查询被中断、2013 socket 读超时、3024 超过最大执行时间。
 TIMEOUT_ERROR_CODES: frozenset[int] = frozenset({1205, 1317, 2013, 3024})
 
-# A statement that returns at or beyond this fraction of its configured deadline is
-# treated as timed out, because MySQL may answer an interrupted statement with a
-# partial result rather than raising a driver error.
+# 语句在接近或超过配置时限的该比例后才返回时，即视为超时；因为 MySQL 对被中断的
+# 语句可能返回部分结果，而不是抛出驱动错误。
 TIMEOUT_FRACTION = 0.9
 
-# Driver fetch batch; the per-statement row limit is enforced on top of this.
+# 驱动抓取批次大小；每语句的行数上限在此之上再做限制。
 BATCH_SIZE = 100
 
 
 class DatabaseUnavailableError(RuntimeError):
-    """Raised when a pooled connection cannot be produced or used."""
+    """当无法从连接池获取或使用连接时抛出。"""
 
 
 class _ConnectionDiscarded(Exception):
-    """Internal signal: a connection is no longer safe to reuse."""
+    """内部信号：某连接已不再安全、不可复用。"""
 
 
 def _redact(error: BaseException) -> str:
-    """Return a safe error code; driver text may embed credentials or SQL."""
+    """返回安全的错误码；驱动文本可能夹带凭据或 SQL。"""
 
     return type(error).__name__
 
@@ -87,14 +84,14 @@ class PoolSettings:
             database=settings.readonly_database,
             pool_size=settings.mysql_readonly_pool_size,
             connect_timeout=settings.mysql_connect_timeout_seconds,
-            # The socket deadline is the hard client-side bound for one read-only
-            # statement; the server-side MAX_EXECUTION_TIME is only a second guard.
+            # socket 期限就是只读单条语句在客户端侧的硬约束；
+            # 服务端的 MAX_EXECUTION_TIME 只是第二道保险。
             read_timeout=settings.sql_query_timeout_seconds,
         )
 
 
 class MySQLConnectionPool:
-    """Small bounded pool; every connection is returned or discarded, never leaked."""
+    """小型有界连接池；每个连接要么归还、要么丢弃，绝不泄露。"""
 
     def __init__(self, settings: PoolSettings, *, autocommit: bool = True) -> None:
         self.settings = settings
@@ -169,7 +166,7 @@ class MySQLConnectionPool:
                 cursor.close()
 
     def discard_current_connection(self) -> None:
-        """Request that the pool drop the connection used by the active context."""
+        """请求连接池丢弃当前上下文正在使用的连接。"""
 
         raise _ConnectionDiscarded()
 
@@ -219,7 +216,7 @@ def _close_quietly(connection: pymysql.connections.Connection) -> None:
 
 @dataclass(frozen=True)
 class StatementOutcome:
-    """Outcome of one validated read-only statement."""
+    """一条已校验只读语句的执行结果。"""
 
     status: Literal["success", "timeout", "failed"]
     columns: tuple[str, ...] = ()
@@ -229,7 +226,7 @@ class StatementOutcome:
 
 
 class ReadOnlyQueryRunner:
-    """Executes only pre-validated, parameterized reads with server-side limits."""
+    """仅执行预先校验、参数化的读取，并施加服务端限制。"""
 
     def __init__(
         self, pool: MySQLConnectionPool, *, timeout_seconds: float, max_result_bytes: int
@@ -252,8 +249,8 @@ class ReadOnlyQueryRunner:
                 cursor.execute(sql, parameters or {})
                 elapsed = time.monotonic() - started
                 if elapsed >= self.timeout_seconds * TIMEOUT_FRACTION:
-                    # MySQL can answer an interrupted statement with a partial result
-                    # instead of an error, so a near-deadline statement is never success.
+                    # MySQL 对被中断的语句可能返回部分结果而非报错，
+                    # 因此接近时限的语句一律不算成功。
                     self.pool.discard_current_connection()
                     return StatementOutcome(status="timeout", error_code="query_timeout")
                 columns = tuple(description[0] for description in (cursor.description or ()))
@@ -266,7 +263,7 @@ class ReadOnlyQueryRunner:
         except pymysql.err.OperationalError as error:
             code = error.args[0] if error.args else None
             if code in TIMEOUT_ERROR_CODES or time.monotonic() - started > self.timeout_seconds:
-                # A socket deadline always leaves the connection unusable or ambiguous.
+                # socket 期限一到，连接要么不可用、要么状态不确定。
                 self.pool.discard_current_connection()
                 return StatementOutcome(status="timeout", error_code="query_timeout")
             return StatementOutcome(status="failed", error_code="database_error")
@@ -280,10 +277,9 @@ class ReadOnlyQueryRunner:
     def _fetch_bounded(
         self, cursor: pymysql.cursors.Cursor, *, max_rows: int
     ) -> tuple[tuple[tuple[Any, ...], ...], bool]:
-        """Read at most ``max_rows`` rows and report whether more rows were available.
+        """最多读取 ``max_rows`` 行，并报告是否还有更多可用行。
 
-        The driver is asked for ``max_rows + 1`` rows so truncation is detected from the
-        result set itself instead of an unbounded extra fetch.
+        向驱动索取 ``max_rows + 1`` 行，从而直接由结果集判断是否截断，避免无边界的额外抓取。
         """
 
         rows: list[tuple[Any, ...]] = []
@@ -309,7 +305,7 @@ class ReadOnlyQueryRunner:
 
 
 def _json_safe(value: Any) -> Any:
-    """Convert driver values into bounded, JSON-serializable primitives."""
+    """将驱动返回值转换为有界、可 JSON 序列化的基本类型。"""
 
     if value is None or isinstance(value, (bool, int, float, str)):
         return value

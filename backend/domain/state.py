@@ -7,7 +7,7 @@ InterruptStatus = Literal["none", "pending", "approved", "rejected", "expired"]
 
 
 class GraphState(TypedDict):
-    """Bounded execution state; Conversation Persistence and Events stay outside this type."""
+    """有界的执行状态；Conversation Persistence 与 Events 不在此类型内。"""
 
     conversation_id: str
     thread_id: str
@@ -26,8 +26,8 @@ class GraphState(TypedDict):
     sql_validation: dict[str, object] | None
     answer_candidate: str | None
     answer_validation: dict[str, object] | None
-    # Candidate-local Answer Validation revision counter owned by the validation
-    # policy (GRAPH_CONTRACT Graph-008 / Graph-005 loop limits).
+    # 候选级 Answer Validation revision 计数器，由 validation policy 拥有
+    # （GRAPH_CONTRACT Graph-008 / Graph-005 的循环上限）。
     answer_revision_count: int
     citations: list[dict[str, object]]
     approval_request_id: str | None

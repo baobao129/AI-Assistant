@@ -1,8 +1,7 @@
-"""Embedding Provider boundary (ADR-007 / PROJECT_SPEC §8).
+"""Embedding Provider 边界（ADR-007 / PROJECT_SPEC §8）。
 
-Business code depends on ``EmbeddingProvider`` only. Provider SDK types and HTTP
-details stay inside the adapters, and provider failures fail the caller instead of
-silently degrading to less trustworthy vectors.
+业务代码只依赖 ``EmbeddingProvider``。provider SDK 类型与 HTTP 细节都留在适配器内部，
+provider 失败会直接让调用方失败，而不是悄悄退化为可信度更低的向量。
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingProviderError(RuntimeError):
-    """The provider could not produce embeddings for the requested input."""
+    """当 provider 无法为所请求的输入生成 embedding 时抛出。"""
 
 
 class EmbeddingProvider(Protocol):
@@ -34,7 +33,7 @@ class EmbeddingProvider(Protocol):
 
 
 class SiliconFlowEmbeddingProvider:
-    """Remote OpenAI-compatible embedding adapter for the SiliconFlow MVP provider."""
+    """面向 SiliconFlow（MVP 的远程 provider）的 OpenAI 兼容 embedding 适配器。"""
 
     provider_name = "siliconflow"
 
@@ -99,10 +98,10 @@ class SiliconFlowEmbeddingProvider:
 
 
 class DeterministicEmbeddingProvider:
-    """Offline provider used by tests and local smoke runs.
+    """供测试与本地 smoke 运行使用的离线 provider。
 
-    It is explicit opt-in configuration (``EMBEDDING_PROVIDER=deterministic``) and
-    never silently replaces the remote provider.
+    它是显式 opt-in 配置（``EMBEDDING_PROVIDER=deterministic``），绝不会悄悄替换远程
+    provider。
     """
 
     provider_name = "deterministic"
@@ -118,6 +117,8 @@ class DeterministicEmbeddingProvider:
         return [self._vector(text) for text in texts]
 
     def _vector(self, text: str) -> list[float]:
+        # 确定性的哈希向量原理：以文本为种子反复做 SHA-256，把摘要字节映射到 [-1, 1]，
+        # 直到填满 dimension 维，最后归一化为单位向量。相同文本必得相同向量，便于离线测试。
         values: list[float] = []
         seed = text.encode("utf-8")
         counter = 0
@@ -134,7 +135,7 @@ class DeterministicEmbeddingProvider:
 
 
 def create_embedding_provider(settings: Settings) -> EmbeddingProvider:
-    """Build the configured adapter without performing any network work."""
+    """构建配置指定的适配器，且构建时不发起任何网络请求。"""
 
     if settings.embedding_provider == "deterministic":
         return DeterministicEmbeddingProvider(dimension=min(settings.embedding_dimension, 256))

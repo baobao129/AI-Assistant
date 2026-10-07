@@ -1,8 +1,7 @@
-"""Main Graph topology per ``docs/contracts/GRAPH_CONTRACT.md``.
+"""依据 ``docs/contracts/GRAPH_CONTRACT.md`` 的主 Graph 拓扑。
 
-Every legal path terminates in a final, safe error, rejection, or unsupported
-outcome. Nodes return bounded partial State updates; Tools are reached only through
-the Tool Registry and Tool Executor.
+每条合法路径都以 final、安全 error、rejection 或 unsupported 结果终止。节点返回
+有界的部分 State 更新；Tool 只能经 Tool Registry 与 Tool Executor 访问。
 """
 
 from __future__ import annotations
@@ -50,11 +49,10 @@ STRUCTURED_TERMS = (
 STRUCTURED_TOOL_IDS = ("database_schema", "database_query", "data_export")
 RAG_TOOL_IDS = ("knowledge_search",)
 
-# Failures that are transient and eligible for the bounded Graph repair budget
-# (`max_repair_attempts`). Security rejections, permission failures, timeouts, and
-# completed side effects are deliberately absent: they are terminal and are never
-# repaired or retried (GRAPH_CONTRACT Graph-009). Transient Tool failures are handled by
-# the owning Tool retry policy, not by this Graph repair path.
+# 属于瞬时失败、可进入有界 Graph repair 预算（`max_repair_attempts`）的错误码。
+# 安全拒绝、权限失败、超时与已完成的副作用被刻意排除：它们是终态，绝不修复或
+# 重试（GRAPH_CONTRACT Graph-009）。瞬时 Tool 失败由所属 Tool 的重试策略处理，
+# 不走这条 Graph repair 路径。
 RECOVERABLE_FAILURE_CODES: frozenset[str] = frozenset(
     {
         "llm_unavailable",
@@ -70,10 +68,10 @@ def failure(
     attempts: int = 0,
     details: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build the bounded error envelope carried in Graph State.
+    """构造承载在 Graph State 中的有界错误信封。
 
-    ``repair_attempts`` is the counter for the Graph/Application repair budget; a new
-    Answer Validation candidate never resets it, and Resume preserves it.
+    ``repair_attempts`` 是 Graph/Application repair 预算的计数器；新的 Answer
+    Validation 候选不会重置它，Resume 也会保留它。
     """
 
     return {
@@ -85,8 +83,8 @@ def failure(
     }
 
 
-# Provider/store failure codes reported by the retrieval Tool are normalized to one
-# stable repair-eligible code; the original code is kept in bounded `details`.
+# retrieval Tool 上报的 provider/store 失败码被归一为一个稳定的、可修复错误码；
+# 原始错误码保留在有界的 `details` 中。
 TRANSIENT_RETRIEVAL_CODES: frozenset[str] = frozenset(
     {
         "embedding_provider_unavailable",
@@ -115,7 +113,7 @@ def repair_count(state: GraphState) -> int:
 
 
 class ToolInvoker(Protocol):
-    """Invocation boundary used by Graph nodes; it never receives Graph State."""
+    """Graph 节点使用的调用边界；它绝不接收 Graph State。"""
 
     def invoke(
         self,
@@ -127,7 +125,7 @@ class ToolInvoker(Protocol):
 
 
 class ScopedToolInvoker:
-    """Binds one execution scope to the Tool Executor for a single Graph Run."""
+    """把单次 Graph Run 的执行作用域绑定到 Tool Executor 上。"""
 
     def __init__(self, executor: ToolExecutor, context: ToolExecutionContext) -> None:
         self.executor = executor
@@ -156,7 +154,7 @@ class ScopedToolInvoker:
 
 
 class IntentRouter:
-    """Deterministic first-pass classifier with explicit safe Routing Outcomes."""
+    """确定性的首轮分类器，输出显式的安全 Routing Outcome。"""
 
     def route(self, user_input: str) -> dict[str, object]:
         query = user_input.strip()
@@ -210,7 +208,7 @@ def intent_router(state: GraphState, router: IntentRouter | None = None) -> dict
 
 
 class RAGNodes:
-    """Dense Retrieval -> Parent-Child Mapping -> Context Build -> Generation."""
+    """Dense Retrieval -> Parent-Child Mapping -> Context Build -> Generation。"""
 
     def __init__(
         self,
@@ -238,8 +236,8 @@ class RAGNodes:
             message = result.error.message if result.error else "Retrieval failed."
             attempts = repair_count(state)
             if result.status == "failed" and raw_code in TRANSIENT_RETRIEVAL_CODES:
-                # A transient provider/store failure is repair-eligible; a rejection
-                # such as an inactive index version is terminal.
+                # 瞬时的 provider/store 失败可进入修复；而诸如索引版本未激活这类
+                # 拒绝是终态。
                 return {
                     "error": failure(
                         "retrieval_unavailable",
@@ -286,7 +284,7 @@ class RAGNodes:
 
     def generation(self, state: GraphState) -> dict[str, object]:
         if not state.get("context"):
-            # No authorized evidence: never fill enterprise facts from pretrained knowledge.
+            # 没有已授权证据：绝不使用预训练知识填补企业事实。
             return {
                 "answer_candidate": (
                     "Insufficient evidence is available in the authorized knowledge sources "
@@ -302,7 +300,7 @@ class RAGNodes:
         )
         try:
             answer = self.general_llm.generate(prompt, state)
-        except Exception:  # noqa: BLE001 - provider failure becomes a repair-eligible error
+        except Exception:  # noqa: BLE001 - provider 失败会转为可修复的错误
             return {
                 "error": failure(
                     "llm_unavailable",
@@ -325,7 +323,7 @@ def general_chat(state: GraphState, llm: GeneralLLM, settings: Settings) -> dict
     )
     try:
         answer = llm.generate(prompt[: settings.llm_max_input_chars], state)
-    except Exception:  # noqa: BLE001 - provider failure becomes a repair-eligible error
+    except Exception:  # noqa: BLE001 - provider 失败会转为可修复的错误
         return {
             "error": failure(
                 "llm_unavailable",
@@ -383,7 +381,7 @@ def sql_model_node(
 
 
 def tools_condition(state: GraphState, budgets: ExecutionBudgets | None = None) -> str:
-    """Conditional edge only; it does not execute Tools or mutate State."""
+    """仅为条件边；它不执行 Tool，也不修改 State。"""
 
     limits = budgets or ExecutionBudgets()
     if state.get("tool_calls") and limits.can_continue_tools(len(state.get("tool_results", []))):
@@ -407,7 +405,7 @@ def tool_executor_node(
 
 
 def tool_result_normalize(state: GraphState) -> dict[str, object]:
-    """Maps an already-produced normalized Tool Result into declared State fields."""
+    """把已生成的规范化 Tool Result 映射到声明的 State 字段。"""
 
     results = state.get("tool_results", [])
     if not results:
@@ -486,8 +484,8 @@ def response_finalize(state: GraphState) -> dict[str, object]:
     terminal_error = state.get("error") or {}
     safe_failure = _safe_failure(str(terminal_error.get("code") or ""))
     if safe_failure:
-        # A terminal (unrepaired) failure outcome states the real safe cause instead of a
-        # generic validation message that would hide it.
+        # 终态（未修复）的失败结果陈述真实的、安全的原因，而不是用一条通用校验
+        # 消息把它掩盖掉。
         answer = safe_failure
     elif status == "insufficient_evidence":
         answer = (
@@ -504,7 +502,7 @@ def response_finalize(state: GraphState) -> dict[str, object]:
 
 
 def _safe_failure(code: str) -> str | None:
-    """User-safe outcome for a terminal (unrepaired) failure code."""
+    """针对终态（未修复）失败码的、对用户安全的结果措辞。"""
 
     if code in {"llm_unavailable", "unsupported_capability"}:
         return (
@@ -522,7 +520,7 @@ def _safe_failure(code: str) -> str | None:
 
 
 def _safe_invalid_result(reasons: list[str]) -> str | None:
-    """A rejected or failed Tool Result gets an explicit, non-misleading safe outcome."""
+    """被拒绝或失败的 Tool Result 得到显式且不误导的安全结果。"""
 
     for reason in reasons:
         if not reason.startswith("tool_error:"):
@@ -551,7 +549,11 @@ def _route_main(state: GraphState) -> str:
 
 
 def _route_validation(state: GraphState, budgets: ExecutionBudgets) -> str:
-    """One bounded revision attempt, otherwise finalize with the validation outcome."""
+    """至多一次有界 revision，否则以校验结果直接 finalize。
+
+    答案修订预算按候选级计算：只允许对 ``retryable_validation_failure`` 修订，安全
+    终态（如 insufficient_evidence / invalid_result）不会进入修订。
+    """
 
     if should_revise(state, budgets):
         return "revise_knowledge" if state.get("intent") == "knowledge" else "revise_structured"
@@ -559,11 +561,11 @@ def _route_validation(state: GraphState, budgets: ExecutionBudgets) -> str:
 
 
 def repair_guard(state: GraphState) -> dict[str, object]:
-    """Advance the repair budget and clear path results before the bounded retry.
+    """在有界重试前推进 repair 预算并清空路径结果。
 
-    Only a repair-eligible failure reaches this node, so the budget is consumed exactly
-    once per repair attempt and never on a security, permission, or validation outcome.
-    The counter lives in ``error.repair_attempts`` so State keeps one bounded envelope.
+    只有 repair-eligible 的失败才会到达此节点，因此预算在每次修复尝试时恰好消耗
+    一次，且绝不会因安全、权限或校验结果而消耗。计数器存放在 ``error.repair_attempts``
+    中，使 State 只保留一个有界信封。
     """
 
     attempts = repair_count(state) + 1
@@ -584,7 +586,7 @@ def repair_guard(state: GraphState) -> dict[str, object]:
 
 
 def _route_assembly(state: GraphState, budgets: ExecutionBudgets) -> str:
-    """Repair a transient path failure within budget, otherwise continue to validation."""
+    """在预算内修复瞬时路径失败，否则继续进入校验。"""
 
     if is_recoverable(state) and budgets.can_repair(repair_count(state)):
         return "repair"
@@ -592,7 +594,7 @@ def _route_assembly(state: GraphState, budgets: ExecutionBudgets) -> str:
 
 
 def _route_repair(state: GraphState) -> str:
-    """Re-enter the declared stage that raised the transient failure."""
+    """重新进入抛出该瞬时失败的声明阶段。"""
 
     intent = state.get("intent")
     if intent == "knowledge":
@@ -603,7 +605,7 @@ def _route_repair(state: GraphState) -> str:
 
 
 def _clear_repair_error(state: GraphState) -> dict[str, object]:
-    """Drop the resolved transient failure while keeping the consumed repair budget."""
+    """清除已解决的瞬时失败，同时保留已消耗的 repair 预算。"""
 
     attempts = repair_count(state)
     if not attempts:
@@ -632,8 +634,8 @@ def build_main_graph(
 ):
     config = settings or Settings(_env_file=None)
     if executor is None:
-        # Development default: the stub registry keeps the skeleton testable without
-        # infrastructure. The runtime always injects the real scoped Tool Executor.
+        # 开发默认：stub registry 使骨架在没有基础设施的情况下仍可测试。
+        # 运行时始终注入真正的 scoped Tool Executor。
         from backend.tools.mock_tools import default_registry
 
         executor = ToolExecutor(default_registry())

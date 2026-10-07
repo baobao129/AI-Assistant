@@ -1,7 +1,7 @@
-"""Schema definition and safe bootstrap for the application database.
+"""应用数据库的 schema 定义与安全引导。
 
-The DDL here is implementation detail; it does not redefine any Core Contract.
-Every statement is idempotent so startup initialization can run repeatedly.
+此处的 DDL 属于实现细节，不重新定义任何 Core Contract。每条语句都是幂等的，
+因此启动初始化可以反复执行。
 """
 
 from __future__ import annotations
@@ -276,11 +276,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 
 
 def initialize_schema(settings: Settings) -> None:
-    """Create missing tables using the application account; never drops data."""
+    """使用应用账号创建缺失的表；绝不删除数据。"""
 
     pool = MySQLConnectionPool(PoolSettings.application(settings, pool_size=1))
     try:
         with pool.cursor() as cursor:
+            # 逐条执行 CREATE TABLE IF NOT EXISTS：重复启动安全，只建缺失的表，不改动已有数据。
             for statement in SCHEMA_STATEMENTS:
                 cursor.execute(statement)
     finally:
@@ -288,10 +289,9 @@ def initialize_schema(settings: Settings) -> None:
 
 
 def initialize_read_only_account(settings: Settings, *, root_password: str) -> bool:
-    """Create the read-only account used by the SQL Agent path.
+    """创建 SQL Agent 路径所用的只读账号。
 
-    Returns ``False`` when administrative credentials are unavailable; the Demo
-    path then documents the manual step instead of failing the application.
+    当管理凭据不可用时返回 ``False``；此时 Demo 路径改为记录手动步骤，而不是让应用启动失败。
     """
 
     password = settings.mysql_readonly_password.get_secret_value()
@@ -312,8 +312,9 @@ def initialize_read_only_account(settings: Settings, *, root_password: str) -> b
     try:
         user = settings.mysql_readonly_user.replace("'", "").replace("\\", "").replace("%", "")
         database = settings.readonly_database.replace("'", "").replace("\\", "").replace("%", "")
-        # The password literal is escaped through the driver; it is never interpolated raw.
+        # 密码字面量经由驱动转义，绝不作为原始字符串拼接。
         escaped_password = connection.escape(password)
+        # 只读账号仅被授予目标库的 SELECT；建号与授权均幂等（IF NOT EXISTS、重复 GRANT 无副作用）。
         statements = (
             f"CREATE USER IF NOT EXISTS '{user}'@'%' IDENTIFIED BY {escaped_password}",
             f"GRANT SELECT ON `{database}`.* TO '{user}'@'%'",

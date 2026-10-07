@@ -33,7 +33,7 @@ class ToolRegistry:
 
 
 class ToolExecutor:
-    """The only invocation boundary; it returns facts and never receives Graph State."""
+    """唯一的调用边界；它返回事实，且从不接收 Graph State。"""
 
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry

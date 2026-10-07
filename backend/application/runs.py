@@ -1,8 +1,8 @@
-"""Chat, Run lifecycle, Graph execution, and SSE event mapping (API-004 / API-005).
+"""对话、Run 生命周期、Graph 执行与 SSE 事件映射（API-004 / API-005）。
 
-The Graph owns execution; this service owns Graph State construction, Tool
-execution scope, Conversation Persistence, Run status, and Application Events.
-It never exposes raw Graph State, Checkpoint data, or hidden reasoning.
+Graph 负责执行；本服务负责 Graph State 构建、Tool 执行范围、
+Conversation Persistence、Run 状态与 Application Events。
+它绝不暴露原始 Graph State、Checkpoint 数据或隐藏推理。
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ class RunService:
         self.checkpointer = checkpointer
         self.tool_executor = tool_executor
 
-    # Request handling ------------------------------------------------------
+    # 请求处理 ------------------------------------------------------
     def start_run(
         self,
         *,
@@ -114,7 +114,7 @@ class RunService:
             raise not_found("Run was not found.")
         return run
 
-    # Execution -------------------------------------------------------------
+    # 执行 -------------------------------------------------------------
     def execute(self, run_id: str) -> str:
         run = self.runs.get(run_id)
         if run is None:
@@ -137,7 +137,7 @@ class RunService:
         return self._run_graph(run=run, state=state, approval_request_id=None)
 
     def resume(self, run_id: str, *, approval_request_id: str | None = None) -> str:
-        """Continue an interrupted Run under the same Thread and Checkpoint lineage."""
+        """在同一 Thread 与 Checkpoint 沿革下继续一个被中断的 Run。"""
 
         run = self.runs.get(run_id)
         if run is None:
@@ -154,7 +154,7 @@ class RunService:
             if approval is not None and approval.status == "approved":
                 state["approval_request_id"] = approval_request_id
                 state["interrupt_status"] = "approved"
-                # Approval binds one immutable snapshot; resume reuses the exact one.
+                # Approval 绑定了一个不可变快照；resume 复用完全相同的那一个。
                 bound_query_result_id = str(approval.binding.get("query_result_id") or "") or None
                 state["query_result_id"] = bound_query_result_id
         return self._run_graph(
@@ -204,7 +204,7 @@ class RunService:
     def _stream_graph(
         self, *, graph: Any, state: GraphState, config: dict, run: RunRecord
     ) -> GraphState:
-        """Stream State snapshots so Application Events follow execution order."""
+        """流式读取 State 快照，使 Application Events 遵循执行顺序。"""
 
         latest: GraphState = state
         seen_intents: set[str] = set()
@@ -212,6 +212,8 @@ class RunService:
         seen_calls = 0
         seen_results = 0
         seen_citations = 0
+        # 以增量游标（seen_*）把执行中不断增长的 State 集合映射为一次性事件，
+        # 避免同一个 Tool Call、Tool Result 或 Citation 被重复发布。
         for snapshot in graph.stream(state, config, stream_mode="values"):
             latest = snapshot
             intent = snapshot.get("intent")
@@ -281,7 +283,7 @@ class RunService:
     def _finalize_run(self, run: RunRecord, state: GraphState) -> str:
         approval_request_id = state.get("approval_request_id")
         if approval_request_id and state.get("interrupt_status") == "pending":
-            # HITL: the waiting Run stays awaiting_approval and is not business-complete.
+            # HITL：等待中的 Run 保持 awaiting_approval，业务上并未完成。
             self.runs.update_status(
                 run.run_id,
                 "awaiting_approval",
