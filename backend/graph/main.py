@@ -385,16 +385,41 @@ def response_finalize(state: GraphState) -> dict[str, object]:
     answer = state.get("answer_candidate") or "The request could not be completed safely."
     validation = state.get("answer_validation") or {}
     status = validation.get("status")
+    reasons = [str(reason) for reason in (validation.get("reasons") or [])]
     if status == "insufficient_evidence":
         answer = (
             "Insufficient evidence is available in the authorized knowledge sources "
             "to answer this question."
         )
     elif status == "invalid_result":
-        answer = "The answer could not be validated against the available evidence."
+        answer = _safe_invalid_result(reasons) or (
+            "The answer could not be validated against the available evidence."
+        )
     elif status == "validation_error":
         answer = "The answer could not be validated safely."
     return {"final_response": answer[:20000]}
+
+
+def _safe_invalid_result(reasons: list[str]) -> str | None:
+    """A rejected or failed Tool Result gets an explicit, non-misleading safe outcome."""
+
+    for reason in reasons:
+        if not reason.startswith("tool_error:"):
+            continue
+        code = reason.split(":", 1)[1]
+        if code in {"sql_rejected", "sensitive_column_blocked", "invalid_columns"}:
+            return (
+                "The requested operation was rejected by the data security boundary. "
+                "It was not executed."
+            )
+        if code in {"approval_rejected", "approval_expired", "approval_pending"}:
+            return "The requested export was not approved, so it was not executed."
+        if code in {"query_timeout"}:
+            return "The query exceeded the configured time limit and was stopped."
+        if code in {"database_unavailable", "database_error"}:
+            return "The structured data source is temporarily unavailable for this request."
+        return f"The structured data operation could not be completed: {code}."
+    return None
 
 
 def _route_main(state: GraphState) -> str:

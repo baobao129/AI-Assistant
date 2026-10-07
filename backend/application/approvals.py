@@ -144,11 +144,9 @@ class ApprovalService:
                 raise conflict("The approval decision could not be applied.")
             if current.successor_run_id:
                 successor = self.runs.get(current.successor_run_id) or successor
-        self.runs.update_status(
-            original.run_id,
-            "handoff_complete",
-            terminal=True,
-        )
+        # Publish the original Run's terminal final event before that Run becomes
+        # terminal, so a client still attached to the waiting stream observes the
+        # handoff instead of a stream that closes without a terminal event.
         self.events.publish(
             run_id=original.run_id,
             thread_id=original.thread_id,
@@ -158,6 +156,11 @@ class ApprovalService:
                 "content": "The export was approved; execution continues in the successor run.",
                 "successor_run_id": successor.run_id,
             },
+        )
+        self.runs.update_status(
+            original.run_id,
+            "handoff_complete",
+            terminal=True,
         )
         return DecisionResult(
             approval_request_id, "approved", original.run_id, "resume_scheduled", successor.run_id
