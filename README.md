@@ -34,11 +34,15 @@ Open http://127.0.0.1:5173 and sign in with `AUTH_BOOTSTRAP_USERNAME` and
 `GET /api/v1/health/live` checks the application process; `GET /api/v1/health` returns 503
 when a dependency is unavailable.
 
-Initialize Demo structured data once the containers are healthy:
+Initialize Demo structured data and the Demo Knowledge index once the containers are healthy:
 
 ```powershell
 docker compose exec backend python -m scripts.seed_demo
+docker compose exec backend python -m scripts.load_demo_knowledge
 ```
+
+`demo/knowledge/` holds the self-created Demo documents. On the host, run the same loaders
+after `scripts/dev-env.ps1`.
 
 ## Local development
 
@@ -48,7 +52,9 @@ the published Compose ports and the offline development providers:
 ```powershell
 . ./scripts/dev-env.ps1
 uv run python -m scripts.seed_demo
+uv run python -m scripts.load_demo_knowledge
 uv run python -m scripts.verify_live     # end-to-end acceptance evidence
+uv run python -m scripts.evaluate        # versioned evaluation dataset + report
 uv run uvicorn backend.api.main:app --host 127.0.0.1 --port 8001 --no-access-log
 ```
 
