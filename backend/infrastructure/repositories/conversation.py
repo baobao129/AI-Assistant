@@ -357,26 +357,52 @@ class RunEventRepository:
         *,
         run_id: str,
         event_id: str,
-        sequence: int,
         event_type: str,
         thread_id: str,
         payload: dict[str, Any],
         created_at: datetime | None = None,
-    ) -> None:
-        self.pool.execute(
-            "INSERT INTO run_events (run_id, sequence, event_id, event_type, thread_id, "
-            "payload_json, "
-            "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (
-                run_id,
-                sequence,
-                event_id,
-                event_type,
-                thread_id,
-                json.dumps(payload, ensure_ascii=False),
-                created_at or utc_now(),
-            ),
-        )
+    ) -> int:
+        """Atomically reserve the next per-Run sequence and persist the event.
+
+        The Run row is locked for the duration, so concurrent publishers (for example a
+        successor Run starting while its predecessor is still finalizing) can never be
+        assigned the same ``sequence``.
+        """
+
+        with self.pool.connection() as connection:
+            connection.begin()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT run_id FROM runs WHERE run_id = %s FOR UPDATE", (run_id,)
+                    )
+                    if cursor.fetchone() is None:
+                        raise KeyError(run_id)
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE run_id = %s",
+                        (run_id,),
+                    )
+                    row = cursor.fetchone()
+                    sequence = (int(row[0]) if row else 0) + 1
+                    cursor.execute(
+                        "INSERT INTO run_events (run_id, sequence, event_id, event_type, "
+                        "thread_id, payload_json, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            run_id,
+                            sequence,
+                            event_id,
+                            event_type,
+                            thread_id,
+                            json.dumps(payload, ensure_ascii=False),
+                            created_at or utc_now(),
+                        ),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return sequence
 
     def list_after(
         self, *, run_id: str, after_event_id: str | None

@@ -100,22 +100,23 @@ class RunEventPublisher:
     ) -> EventEnvelope:
         if event_type not in SSE_EVENT_TYPES:
             raise ValueError(f"Unsupported SSE event type: {event_type}")
-        sequence = self.repository.max_sequence(run_id) + 1
+        event_id = new_id()
+        # The store reserves the per-Run sequence atomically; the returned sequence is
+        # authoritative and already stored for this event.
+        sequence = self.repository.append(
+            run_id=run_id,
+            event_id=event_id,
+            event_type=event_type,
+            thread_id=thread_id,
+            payload=payload,
+        )
         envelope = EventEnvelope(
-            event_id=new_id(),
+            event_id=event_id,
             sequence=sequence,
             thread_id=thread_id,
             run_id=run_id,
             event_type=event_type,
             timestamp=to_rfc3339(utc_now()) or "",
-            payload=payload,
-        )
-        self.repository.append(
-            run_id=run_id,
-            event_id=envelope.event_id,
-            sequence=sequence,
-            event_type=event_type,
-            thread_id=thread_id,
             payload=payload,
         )
         if sequence % 50 == 0:
