@@ -71,7 +71,11 @@ class Settings(BaseSettings):
 
     # Parser
     parser_provider: Literal["lightweight", "mineru"] = "lightweight"
-    mineru_base_url: str = "http://mineru:8000"
+    # mineru.net v4 云解析 API 的基地址（适配器在其上拼接 /file-urls/batch 与
+    # /extract-results/batch/{batch_id}）；本地自托管 MinerU 也可用同构地址覆盖。
+    mineru_base_url: str = "https://mineru.net/api/v4"
+    mineru_api_key: SecretStr = SecretStr("")
+    mineru_model_version: Literal["pipeline", "vlm"] = "pipeline"
     parser_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
     # 分块与上下文边界

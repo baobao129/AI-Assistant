@@ -112,7 +112,10 @@ services:
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       PARSER_PROVIDER: ${PARSER_PROVIDER:-lightweight}
-      MINERU_BASE_URL: ${MINERU_BASE_URL:-http://mineru:8000}
+      # mineru.net v4 云解析：基地址 + Token + 模型版本（PARSER_PROVIDER=mineru 时生效）
+      MINERU_BASE_URL: ${MINERU_BASE_URL:-https://mineru.net/api/v4}
+      MINERU_API_KEY: ${MINERU_API_KEY:-}
+      MINERU_MODEL_VERSION: ${MINERU_MODEL_VERSION:-pipeline}
       SQL_MAX_ROWS: ${SQL_MAX_ROWS:-100}
       SQL_QUERY_TIMEOUT_SECONDS: ${SQL_QUERY_TIMEOUT_SECONDS:-10}
       DATA_SOURCE_ID: ${DATA_SOURCE_ID:-demo_sales}

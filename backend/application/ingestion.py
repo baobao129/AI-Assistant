@@ -100,7 +100,9 @@ class IngestionService:
             raise validation_error("The uploaded file is empty.")
         if len(data) > self.settings.max_document_bytes:
             raise validation_error("The uploaded file exceeds the configured size limit.")
-        if not supported_content_type(content_type, filename):
+        if not supported_content_type(
+            content_type, filename, allow_remote_parser=self.settings.parser_provider == "mineru"
+        ):
             raise validation_error("This document format is not supported.")
 
         fingerprint = hashlib.sha256(data).hexdigest()
