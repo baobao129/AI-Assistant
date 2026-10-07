@@ -1,3 +1,5 @@
+"""Phase 2 路由意图、能力边界与 General 路径不使用企业 Tool 的测试。"""
+
 from backend.domain.state import initial_state
 from backend.graph.main import IntentRouter, build_main_graph
 from backend.infrastructure.config import Settings
@@ -21,6 +23,7 @@ def test_router_exposes_three_intents_and_all_safe_outcomes():
 
 
 def test_local_without_tool_calling_is_rejected_at_structured_boundary():
+    # local profile 未声明 tool_calling 能力，进入 structured_data 边界时应安全拒绝。
     graph = build_main_graph(
         executor=ToolExecutor(default_registry()),
         settings=Settings(_env_file=None, llm_provider="local"),
@@ -48,5 +51,6 @@ def test_general_path_never_invokes_enterprise_tools():
         initial_state(conversation_id="c", thread_id="t", run_id="r", user_input="say hello")
     )
 
+    # General 路径若调用任何 Tool 都会触发 RecordingExecutor 抛错，从而暴露越界。
     assert result["current_path"] == "general"
     assert executor.calls == []

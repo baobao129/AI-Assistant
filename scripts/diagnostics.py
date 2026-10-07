@@ -1,13 +1,13 @@
-"""Focused live diagnostics for the Compose-backed runtime.
+"""针对 Compose 运行时的聚焦在线诊断。
 
-These are development aids for failure investigation; ``scripts/verify_live.py`` holds the
-acceptance evidence. Run them with ``scripts/dev-env.ps1`` loaded.
+这些是用于故障排查的开发辅助工具；验收证据在 ``scripts/verify_live.py`` 中。
+请在加载 ``scripts/dev-env.ps1`` 后运行。
 
-Usage:
+用法：
 
-    uv run python -m scripts.diagnostics stream    # one Run's SSE stream
-    uv run python -m scripts.diagnostics repeat    # several Runs plus the export flow
-    uv run python -m scripts.diagnostics service   # Run/Approval services without HTTP
+    uv run python -m scripts.diagnostics stream    # 单个 Run 的 SSE 流
+    uv run python -m scripts.diagnostics repeat    # 多个 Run 加导出流程
+    uv run python -m scripts.diagnostics service   # 不带 HTTP 的 Run/Approval 服务
 """
 
 from __future__ import annotations

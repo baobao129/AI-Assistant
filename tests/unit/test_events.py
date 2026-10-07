@@ -1,4 +1,4 @@
-"""Run Event sequencing, replay, and SSE wire-format tests."""
+"""Run Event 的序列号、回放与 SSE wire-format 测试。"""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ from backend.application.events import (
 
 
 class FakeRunEventRepository:
-    """In-memory stand-in for the Run Event replay store."""
+    """Run Event 回放存储的内存替身。"""
 
     def __init__(self) -> None:
         self.rows: dict[str, list[tuple[str, int, str, str, dict, object]]] = {}
         self.trimmed: list[tuple[str, int]] = []
 
     def append(self, *, run_id, event_id, event_type, thread_id, payload, created_at=None) -> int:
-        """Reserve the next per-Run sequence, mirroring the SQL FOR UPDATE contract."""
+        """预留该 Run 的下一个 sequence，模拟 SQL ``FOR UPDATE`` 的加锁语义。"""
 
         rows = self.rows.setdefault(run_id, [])
         sequence = max((int(row[1]) for row in rows), default=0) + 1
@@ -88,6 +88,7 @@ def test_replay_returns_events_after_the_requested_event():
 
 
 def test_sse_wire_format_carries_the_complete_envelope():
+    # wire-format 必须是 id/event/data 三行，data 为完整 JSON 信封且以空行结尾。
     publisher, _ = _publisher()
     envelope = publisher.publish(
         run_id="r1", thread_id="t1", event_type="token", payload={"delta": "hi"}
@@ -112,6 +113,7 @@ def test_sse_wire_format_carries_the_complete_envelope():
 
 
 def test_subscription_receives_events_and_closes_after_final():
+    # 订阅者在独立线程发布事件；terminal 的 final 之后流应自动关闭。
     publisher, _ = _publisher()
     subscription = publisher.subscribe(run_id="r1")
     thread = threading.Thread(
@@ -143,7 +145,7 @@ def test_subscription_timeout_returns_none_for_heartbeats():
 
 
 def test_trim_is_requested_at_the_retention_boundary():
-    """Retention is maintained periodically (every 50 published events within a Run)."""
+    """保留窗口按周期维护（同一 Run 内每发布 50 个事件触发一次裁剪）。"""
 
     repository = FakeRunEventRepository()
     publisher = RunEventPublisher(repository=repository, retention_events=50)
@@ -155,6 +157,7 @@ def test_trim_is_requested_at_the_retention_boundary():
 
 
 def test_publish_never_blocks_when_no_subscriber_exists():
+    # 没有订阅者时发布不得阻塞，且 terminal 事件后流立即标记为已关闭。
     publisher, _ = _publisher()
     envelope = publisher.publish(run_id="r1", thread_id="t1", event_type="final", payload={})
     assert envelope.sequence == 1

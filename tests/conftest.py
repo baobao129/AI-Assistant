@@ -1,8 +1,8 @@
-"""Shared test fixtures.
+"""共享的测试 fixture。
 
-Database-backed tests are opt-in through ``TEST_MYSQL_HOST`` / ``TEST_MYSQL_PORT``
-so the default suite stays infrastructure-independent; run them against the Compose
-runtime with the exported variables recorded in the repository handoff notes.
+依赖数据库的测试通过 ``TEST_MYSQL_HOST`` / ``TEST_MYSQL_PORT`` 选择性地启用，
+以便默认测试套件保持与基础设施解耦；需要对照 Compose 运行时执行这些测试时，
+按仓库交接说明中记录的方式导出相应变量即可。
 """
 
 from __future__ import annotations
@@ -15,10 +15,12 @@ from backend.infrastructure.config import Settings
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # 注册 live_db marker，供需要真实 MySQL/Milvus 的用例按标记筛选。
     config.addinivalue_line("markers", "live_db: requires the Compose MySQL/Milvus runtime")
 
 
 def _test_settings() -> Settings:
+    # 固定使用 deterministic embedding 与 mock LLM，避免实时测试依赖外部 provider。
     return Settings(
         _env_file=None,
         mysql_host=os.environ.get("TEST_MYSQL_HOST", "127.0.0.1"),
@@ -42,8 +44,10 @@ def _test_settings() -> Settings:
 
 @pytest.fixture(scope="session")
 def live_settings() -> Settings:
-    """Settings for database-backed tests; skips when no test credentials are exported."""
+    """面向数据库测试的 Settings；未导出测试凭据时直接跳过用例。"""
 
+    # 缺少任一数据库口令都视为「未配置实时环境」，跳过而非失败，
+    # 这样默认套件在没有 Compose 运行时也能全绿。
     if not os.environ.get("TEST_MYSQL_PASSWORD"):
         pytest.skip("TEST_MYSQL_PASSWORD is not exported; live database tests are skipped.")
     if not os.environ.get("TEST_MYSQL_READONLY_PASSWORD"):

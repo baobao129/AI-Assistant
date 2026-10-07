@@ -1,3 +1,5 @@
+"""主图端到端路由、Tool Loop 有界性与 Checkpoint 调用的进程内集成测试。"""
+
 from pathlib import Path
 
 from backend.domain.checkpoint import checkpoint_context
@@ -9,6 +11,7 @@ from backend.tools.registry import ToolExecutor
 
 
 def run(query: str):
+    # 用默认 Registry 构造主图并直接 invoke，不接数据库与外部 provider。
     graph = build_main_graph(ToolExecutor(default_registry()))
     return graph.invoke(
         initial_state(conversation_id="c", thread_id="t", run_id="r", user_input=query)
@@ -25,6 +28,7 @@ def test_three_intents_route_and_terminate():
 
 
 def test_non_routed_outcomes_keep_current_path_null():
+    # 非 routed 的 Routing Outcome 一律保持 current_path 为 None。
     for query, outcome in [
         ("", "invalid_request"),
         ("policy document sales amount", "unsupported_mixed_query"),
@@ -58,6 +62,7 @@ def test_graph_accepts_explicit_budgets():
 
 
 def test_sqlite_checkpoint_graph_invocation(tmp_path: Path):
+    # 传入 checkpointer 并显式提供 thread_id，验证图可在持久化检查点上执行。
     with checkpoint_context("sqlite", tmp_path / "checkpoints.sqlite") as saver:
         graph = build_main_graph(checkpointer=saver)
         result = graph.invoke(

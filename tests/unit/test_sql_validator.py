@@ -1,8 +1,7 @@
-"""SQL Validator policy tests.
+"""SQL Validator 策略测试。
 
-The long statements below are intentionally kept on one physical line so the
-validated text stays exactly what the test asserts; the E501 exemption is scoped
-to this module.
+下面这些长语句被刻意保留在同一物理行内，以便校验的文本与用例断言完全一致；
+E501 豁免被限定在本模块范围内。
 """
 
 # ruff: noqa: E501
@@ -23,6 +22,7 @@ ACCEPTED = [
     "SELECT order_id FROM enterprise_agent.sales_orders LIMIT 3",
 ]
 
+# 键为待校验 SQL，值为期望的拒绝原因码之一。
 REJECTED = {
     "": "empty_statement",
     "SELECT FROM WHERE": "unparseable_statement",
@@ -85,11 +85,13 @@ def test_complexity_score_rejects_deeply_nested_aggregation():
 
 
 def test_validator_never_returns_sql_text_in_reasons():
+    # 拒绝原因中不得回显原始 SQL 片段，避免泄漏表名等敏感信息。
     result = VALIDATOR.validate("SELECT * FROM users LIMIT 5")
     assert "users" not in " ".join(result.reasons)
 
 
 def test_validator_reports_every_independent_violation():
+    # 多个独立违规必须全部上报，而不是遇到第一个就短路返回。
     result = VALIDATOR.validate("SELECT * FROM users LIMIT 100000")
     assert result.status == "rejected"
     assert {"select_star_blocked", "table_not_allowed", "limit_exceeds_maximum"} <= set(

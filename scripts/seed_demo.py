@@ -1,9 +1,9 @@
-"""Idempotent Demo data seeding through the application Data Source boundary.
+"""通过应用 Data Source 边界进行幂等的 Demo 数据播种。
 
-Demo sales/procurement records are replaceable fixtures (PROJECT_SPEC §16). They are
-loaded with the application account and read exclusively through the read-only account.
+Demo 的销售/采购记录是可替换的固定数据（PROJECT_SPEC §16）。它们用应用账号加载，
+并仅通过 read-only 账号读取。
 
-Usage (same environment as the backend, see README):
+用法（与 backend 相同的环境，见 README）：
 
     uv run python -m scripts.seed_demo
 """

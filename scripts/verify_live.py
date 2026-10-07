@@ -1,11 +1,10 @@
-"""Live-database verification of the Demo path.
+"""Demo 路径的在线数据库验证。
 
-Runs the real application container against the Compose MySQL/Milvus runtime with the
-deterministic embedding provider, then exercises authentication, Conversation/Run
-creation, SSE delivery, Structured Data Tool Calling through the SQL Validator and the
-read-only account, Knowledge upload/retrieval, and the HITL export approval flow.
+让真实应用容器连接 Compose 的 MySQL/Milvus 运行时，并使用确定性 embedding provider，
+然后依次验证认证、Conversation/Run 创建、SSE 投递、经 SQL Validator 与 read-only 账号
+的结构化数据 Tool Calling、Knowledge 上传/检索，以及 HITL 导出审批流程。
 
-Usage (see README "Local development"):
+用法（见 README "Local development"）：
 
     uv run python -m scripts.verify_live
 """
@@ -74,7 +73,7 @@ def main() -> int:
             failures.append(name)
 
     with TestClient(app) as client:
-        # Authentication ---------------------------------------------------
+        # 认证 -------------------------------------------------------------
         anonymous = client.get("/api/v1/conversations")
         check(
             "unauthenticated_access_rejected", anonymous.status_code == 401, anonymous.status_code
@@ -97,7 +96,7 @@ def main() -> int:
         check("conversation_created", created.status_code == 201, created.status_code)
         conversation_id = created.json()["conversation_id"]
 
-        # Structured Data path: Tool Calling through the SQL Validator ------
+        # 结构化数据路径：经 SQL Validator 的 Tool Calling -------------------
         accepted = client.post(
             f"/api/v1/conversations/{conversation_id}/runs",
             json={"user_input": "show sales amount by region"},
@@ -153,7 +152,7 @@ def main() -> int:
                 },
             )
 
-        # Unsafe SQL is rejected without a database side effect ------------
+        # 不安全 SQL 会被拒绝，且不产生数据库副作用 -------------------------
         unsafe = client.post(
             f"/api/v1/conversations/{conversation_id}/runs",
             json={"user_input": "drop sales table amount"},
@@ -168,7 +167,7 @@ def main() -> int:
                 tool_results,
             )
 
-        # General path ------------------------------------------------------
+        # 通用路径 ---------------------------------------------------------
         general = client.post(
             f"/api/v1/conversations/{conversation_id}/runs",
             json={"user_input": "hello there"},
@@ -182,9 +181,9 @@ def main() -> int:
                 [e["event_type"] for e in stream],
             )
 
-        # Knowledge ingestion and retrieval --------------------------------
-        # Unique content per run keeps the assertion deterministic: a near-duplicate of
-        # other Demo documents can legitimately be crowded out of a small top_k window.
+        # Knowledge 上传与检索 ---------------------------------------------
+        # 每次运行使用唯一内容以保证断言确定：与其他 Demo 文档近似重复的内容
+        # 可能会在小 top_k 窗口中被合理地挤出。
         marker = f"verify{uuid.uuid4().hex[:10]}"
         knowledge_text = (
             f"Enterprise Travel Policy {marker}\n\n"
@@ -216,8 +215,8 @@ def main() -> int:
                         break
                     _sleep(client, 0.5)
             else:
-                # A duplicate of an already indexed Document reuses the active version,
-                # so no new Job exists and the reported status is the reused one.
+                # 已索引 Document 的重复项会复用 active 版本，
+                # 因此不会创建新 Job，上报的状态即被复用的状态。
                 job_status = upload.json()["status"]
             check(
                 "upload_job_or_reuse",
@@ -226,12 +225,11 @@ def main() -> int:
             )
             check("ingestion_succeeded", job_status == "success", job_status)
             document_id = upload.json()["document_id"]
-            # Read the Document directly so this assertion cannot be truncated by the
-            # bounded list page.
+            # 直接读取 Document，使该断言不会被有界的列表分页所截断。
             document = client.get(f"/api/v1/documents/{document_id}", headers=headers).json()
             if duplicate and not document.get("active_index_version"):
-                # A reused Document that was never successfully indexed is re-indexed so
-                # the Knowledge assertions below run against a real active version.
+                # 对从未成功索引过的复用 Document 重新索引，
+                # 以便下面的 Knowledge 断言针对真实的 active 版本运行。
                 reindex = client.post(f"/api/v1/documents/{document_id}/reindex", headers=headers)
                 if reindex.status_code == 202:
                     reindex_job = reindex.json()["ingestion_job_id"]
@@ -274,7 +272,7 @@ def main() -> int:
                     final and final["payload"]["content"][:100],
                 )
 
-        # Structured Data inspection APIs ----------------------------------
+        # 结构化数据检查 API -----------------------------------------------
         sources = client.get("/api/v1/data-sources", headers=headers).json()
         check("data_sources_listed", sources["items"][0]["table_count"] >= 3, sources)
         tables = client.get(
@@ -305,7 +303,7 @@ def main() -> int:
             "unknown_table_not_found", unknown_table.status_code == 404, unknown_table.status_code
         )
 
-        # HITL export approval ---------------------------------------------
+        # HITL 导出审批 ----------------------------------------------------
         export = client.post(
             f"/api/v1/conversations/{conversation_id}/runs",
             json={"user_input": "export sales amount data to csv"},
@@ -313,9 +311,8 @@ def main() -> int:
         )
         if export.status_code == 202:
             run_id = export.json()["run_id"]
-            # The waiting Run stays awaiting_approval. Read the persisted Run Event
-            # history through the replay path instead of holding a live stream open
-            # across the human decision.
+            # 等待中的 Run 保持 awaiting_approval。通过 replay 路径读取持久化的
+            # Run Event 历史，而不是在人工决策期间持有实时流。
             run_state = _await_status(
                 client, run_id, headers, {"awaiting_approval", "failed", "completed"}
             )
@@ -382,8 +379,8 @@ def main() -> int:
                             ),
                             successor_state["status"],
                         )
-                        # The approved artifact is bound to the approval request, so a
-                        # repeated decision cannot create a second export.
+                        # 已批准的产物绑定到 approval request，因此重复的
+                        # 决策不会创建第二个导出。
                         replay = client.post(
                             f"/api/v1/approvals/{approval_request_id}/approve",
                             json={
@@ -409,7 +406,7 @@ def main() -> int:
 
 
 def _replay_events(client, run_id: str, headers: dict[str, str], *, limit: int = 400) -> list[dict]:
-    """Read the retained Run Event history through the SSE replay path."""
+    """通过 SSE replay 路径读取保留的 Run Event 历史。"""
 
     events: list[dict] = []
     with client.stream("GET", f"/api/v1/runs/{run_id}/events", headers=headers) as response:
@@ -432,7 +429,7 @@ def _await_status(
     *,
     deadline: float = 60.0,
 ) -> dict:
-    """Poll Run status until it reaches one of ``statuses`` or the deadline passes."""
+    """轮询 Run 状态，直到其进入 ``statuses`` 之一或到达截止时间。"""
 
     import time
 
@@ -452,7 +449,7 @@ def _read_stream(
     limit: int = 400,
     deadline: float = 90.0,
 ) -> list[dict]:
-    """Read one Run's live SSE stream until a terminal event or the bounded deadline."""
+    """读取单个 Run 的实时 SSE 流，直到遇到终态事件或到达有界截止时间。"""
 
     import time
 

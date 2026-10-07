@@ -1,9 +1,8 @@
-"""Critical E2E/Smoke checks.
+"""关键 E2E/Smoke 检查。
 
-The dependency-health check runs against whatever ``SMOKE_BASE_URL`` points at. The
-authenticated Demo flow additionally requires ``SMOKE_USERNAME`` and ``SMOKE_PASSWORD``
-and exercises login, Conversation/Run creation, SSE event ordering, replay, and the
-Document upload path through the real HTTP surface.
+依赖健康检查针对 ``SMOKE_BASE_URL`` 指向的服务运行。带认证的 Demo 流程还额外需要
+``SMOKE_USERNAME`` 与 ``SMOKE_PASSWORD``，并通过真实 HTTP 接口走一遍登录、Conversation/Run
+创建、SSE 事件顺序、回放以及 Document 上传路径。
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import pytest
 
 
 def _base_url() -> str:
+    # 未配置目标地址时跳过，保证默认套件不因缺少实时运行时而失败。
     url = os.getenv("SMOKE_BASE_URL")
     if not url:
         pytest.skip("Set SMOKE_BASE_URL to the running frontend URL for live acceptance.")
@@ -39,6 +39,7 @@ def test_live_runtime():
 
 
 def _read_events(client: httpx.Client, run_id: str, headers: dict[str, str]) -> list[dict]:
+    # 有界读取 SSE：遇到终态 final/error 或超过 60 秒截止时间即停止。
     events: list[dict] = []
     deadline = time.monotonic() + 60
     with client.stream("GET", f"/api/v1/runs/{run_id}/events", headers=headers) as response:
@@ -94,7 +95,7 @@ def test_live_authenticated_demo_flow():
         assert all(event["run_id"] == run_id for event in events)
         assert len({event["event_id"] for event in events}) == len(events)
 
-        # Replay from the first event returns the retained stream, not a new Run.
+        # 从首个事件开始回放，应返回保留的事件流，而不是一个新的 Run。
         last_event_id = events[0]["event_id"]
         with client.stream(
             "GET",
@@ -108,7 +109,7 @@ def test_live_authenticated_demo_flow():
         assert [event["sequence"] for event in replayed][:1] == [2]
         assert client.get(f"/api/v1/runs/{run_id}", headers=headers).json()["status"] == "completed"
 
-        # Documents are listed from the application registry, never from Milvus.
+        # Document 列表来自应用注册表，绝不直接查 Milvus。
         listed = client.get("/api/v1/documents", headers=headers)
         assert listed.status_code == 200
         assert "items" in listed.json()

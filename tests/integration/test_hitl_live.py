@@ -1,8 +1,7 @@
-"""Live integration checks for the HITL approval state machine.
+"""HITL 审批状态机的实时集成检查。
 
-These run against the configured application database and are skipped unless live
-credentials are exported (see ``tests/conftest.py``). They cover the waiting Run,
-successor creation, duplicate decisions, rejection, and expiry without a side effect.
+这些用例针对已配置的应用数据库运行；未导出实时凭据时会被跳过（见 ``tests/conftest.py``）。
+覆盖等待中的 Run、后继执行创建、重复审批决定、拒绝，以及不产生副作用的过期。
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def harness(live_settings):
+    # 模块级共享一个已登录的真实容器，并在其中创建一个会话用于发起 Run。
     from fastapi.testclient import TestClient
 
     from backend.api.dependencies import build_container
@@ -40,6 +40,7 @@ def harness(live_settings):
 
 
 def _await_status(client, run_id: str, statuses: set[str], *, deadline: float = 60.0) -> str:
+    # 有界轮询：持续查询 Run 状态直到命中目标集合或超时，避免死等。
     started = time.monotonic()
     status = "unknown"
     while time.monotonic() - started < deadline:
@@ -51,6 +52,7 @@ def _await_status(client, run_id: str, statuses: set[str], *, deadline: float = 
 
 
 def _start_export(client, conversation_id: str) -> tuple[str, str]:
+    # data_export 属高风险操作，触发 HITL：Run 应停在 awaiting_approval。
     accepted = client.post(
         f"/api/v1/conversations/{conversation_id}/runs",
         json={"user_input": "export sales amount data to csv"},
@@ -66,6 +68,7 @@ def _start_export(client, conversation_id: str) -> tuple[str, str]:
 
 
 def container_run_events(client, run_id: str) -> list[dict]:
+    # 读取 SSE 直到 approval_required：该事件之后等待中的 Run 会主动关闭连接。
     import json
 
     events: list[dict] = []
@@ -86,6 +89,8 @@ def _approval_request_id(events: list[dict]) -> str:
 
 @pytest.mark.live_db
 def test_waiting_run_approval_creates_successor_and_is_idempotent(harness):
+    # Approve 按 approval_request_id 幂等：重复审批返回同一 successor，
+    # 且不能再对该请求执行 Reject（返回 409）。
     client = harness["client"]
     conversation_id = harness["conversation_id"]
     run_id, approval_request_id = _start_export(client, conversation_id)
@@ -113,6 +118,7 @@ def test_waiting_run_approval_creates_successor_and_is_idempotent(harness):
 
 @pytest.mark.live_db
 def test_rejection_is_terminal_and_creates_no_successor(harness):
+    # Reject 是终态且不创建后继执行；重复 Reject 幂等返回 resume_scheduled。
     client = harness["client"]
     conversation_id = harness["conversation_id"]
     run_id, approval_request_id = _start_export(client, conversation_id)
@@ -134,12 +140,13 @@ def test_rejection_is_terminal_and_creates_no_successor(harness):
 
 @pytest.mark.live_db
 def test_expiry_makes_the_run_expired_without_a_successor(harness):
+    # 过期后 Run 变为 expired，且不能再用原审批执行（409），不会产生副作用。
     client = harness["client"]
     container = harness["container"]
     conversation_id = harness["conversation_id"]
     run_id, approval_request_id = _start_export(client, conversation_id)
 
-    # Expire the request through the same bounded maintenance path the worker uses.
+    # 通过 worker 使用的同一条有界维护路径把审批置为过期，而不是直接改状态字段。
     from backend.domain.identifiers import utc_now
 
     container.runtime.approvals.pool.execute(

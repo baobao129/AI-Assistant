@@ -1,4 +1,4 @@
-"""Parser adapter and Parent/Child chunking tests."""
+"""Parser 适配器与 Parent/Child 分块测试。"""
 
 import pytest
 
@@ -56,6 +56,7 @@ def test_supported_content_types():
 
 
 def test_chunking_creates_bounded_parents_and_overlapping_children():
+    # Parent 上限约为 parent_chars 的两倍，Child 需带上重叠以满足上下文连续性。
     text = "\n\n".join(f"Paragraph {index} " + "word " * 60 for index in range(6))
     chunked = chunk_document(text, parent_chars=900, child_chars=300, overlap_chars=60)
     assert chunked.parents, "parents must be produced"

@@ -1,8 +1,7 @@
-"""Live integration checks for the ingestion lifecycle and startup recovery (ADR-009/019).
+"""摄取生命周期与启动恢复的实时集成检查（ADR-009/019）。
 
-These run against the configured application database and are skipped unless live
-credentials are exported (see ``tests/conftest.py``). Each test uses distinct content so
-content-fingerprint deduplication cannot couple the cases.
+这些用例针对已配置的应用数据库运行；未导出实时凭据时会被跳过（见 ``tests/conftest.py``）。
+每个用例都使用互不相同的内容，避免内容指纹去重把不同用例耦合在一起。
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import pytest
 
 
 def document_text(label: str) -> str:
-    """Unique content per test so duplicate detection cannot reuse an earlier fixture."""
+    """为每个用例生成唯一内容，使去重检测无法复用更早用例的 fixture。"""
 
     return (
         f"Ingestion Lifecycle Fixture {label} {uuid.uuid4().hex}\n\n"
@@ -24,6 +23,7 @@ def document_text(label: str) -> str:
 
 @pytest.fixture(scope="module")
 def harness(live_settings):
+    # 模块级共享一个真实容器；bootstrap Demo 用户不存在时现场创建。
     from backend.api.dependencies import build_container
 
     settings = live_settings
@@ -92,7 +92,7 @@ def test_duplicate_upload_reuses_the_active_document(harness):
     assert second.document_id == outcome.document_id
     document = container.runtime.documents.get(second.document_id, user_id=user.user_id)
     assert document is not None and document.status == "available"
-    # A duplicate submission reuses the active version and does not add a new one.
+    # 重复提交会复用当前 active 版本，而不会新增版本。
     assert second.index_version == document.active_index_version
     versions = container.runtime.versions.list_for_document(document.document_id)
     assert len(versions) == 1
@@ -125,7 +125,7 @@ def test_reindex_promotes_a_new_version_and_retires_the_old_one(harness):
     assert len(active) == 1
     assert active[0].index_version == reindex.index_version
 
-    # A further reindex is accepted, creates a new version, and still leaves one active.
+    # 再次 reindex 仍被接受，生成新版本，并且始终只保留一个 active 版本。
     third = container.runtime.ingestion.submit_reindex(
         user_id=user.user_id, document_id=upload.document_id
     )
@@ -149,7 +149,7 @@ def test_failed_job_retry_creates_a_new_job_with_incremented_attempt(harness):
         container.runtime.ingestion.process_job(upload.ingestion_job_id, payload=payload)
         == "success"
     )
-    # Force a bounded failure on a fresh reindex so the retry path is exercised for real.
+    # 在新 reindex 上强制制造一次有界失败，从而真实地走一遍 retry 路径。
     reindex = container.runtime.ingestion.submit_reindex(
         user_id=user.user_id, document_id=upload.document_id
     )
@@ -169,11 +169,11 @@ def test_failed_job_retry_creates_a_new_job_with_incremented_attempt(harness):
     second = container.runtime.jobs.get(retry.ingestion_job_id)
     assert second is not None
     assert second.attempt == first.attempt + 1
-    # The original remains history and is not overwritten.
+    # 原 Job 作为历史保留，不会被重试覆盖。
     assert container.runtime.jobs.get(reindex.ingestion_job_id).status == "failed"
     assert container.runtime.ingestion.process_job(retry.ingestion_job_id) == "success"
 
-    # Only failed Jobs are retryable.
+    # 只有 failed 状态的 Job 才允许重试。
     with pytest.raises(AppError):
         container.runtime.ingestion.submit_retry(
             user_id=user.user_id, ingestion_job_id=retry.ingestion_job_id
@@ -190,7 +190,7 @@ def test_startup_recovery_fails_stale_running_jobs(harness):
     user = harness["user"]
     upload, _payload = _upload(container, user, label="recovery")
     job_id = upload.ingestion_job_id
-    # Simulate a worker that claimed the Job and then died.
+    # 模拟一个 worker 已 claim 该 Job 后崩溃：claim 成功但长时间不再推进。
     assert container.runtime.jobs.claim(job_id) is True
     container.runtime.jobs.pool.execute(
         "UPDATE ingestion_jobs SET updated_at = %s, created_at = %s WHERE ingestion_job_id = %s",
@@ -201,9 +201,9 @@ def test_startup_recovery_fails_stale_running_jobs(harness):
     job = container.runtime.jobs.get(job_id)
     assert job is not None and job.status == "failed"
     assert job.failure_code == "stale_running_job"
-    # Retrieval no longer offers a Document that was never promoted.
+    # 检索不再对外提供这个从未成功晋升过的 Document。
     document = container.runtime.documents.get(upload.document_id, user_id=user.user_id)
     assert document is not None and document.active_index_version is None
-    # The failed Job is retryable and, with no stored text yet, fails safely.
+    # 该 failed Job 可重试；由于尚未存有文本，重试会安全地失败而非崩溃。
     retry = container.runtime.ingestion.submit_retry(user_id=user.user_id, ingestion_job_id=job_id)
     assert container.runtime.ingestion.process_job(retry.ingestion_job_id) == "failed"

@@ -1,3 +1,5 @@
+"""LLM provider 的能力声明与 CapabilityResolver 解析测试。"""
+
 import pytest
 
 from backend.domain.state import initial_state
@@ -14,8 +16,7 @@ from backend.infrastructure.llm import (
 
 
 def test_remote_is_the_default_complete_capability_profile_without_startup_connection(monkeypatch):
-    # The default is asserted explicitly so an exported development profile cannot
-    # change what this test verifies.
+    # 显式断言默认值，避免外部导出的开发 profile 改变本用例要验证的行为。
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     settings = Settings(_env_file=None, llm_provider="remote")
     provider = create_llm_provider(settings)

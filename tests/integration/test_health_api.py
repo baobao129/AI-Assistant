@@ -1,3 +1,5 @@
+"""健康检查、请求关联与受保护端点的 API 契约测试。"""
+
 from fastapi.testclient import TestClient
 
 from backend.api.main import create_app
@@ -13,13 +15,14 @@ class Probe:
 
 
 class FakeContainer:
-    """Minimal container stand-in for API-contract tests that need no database."""
+    """最小化的容器替身，供不需要数据库的 API 契约测试使用。"""
 
     def close(self) -> None:
         return None
 
 
 def test_health_and_correlation():
+    # 健康检查回显 X-Request-ID；未认证请求返回 401，未知端点返回 404 结构化错误体。
     with TestClient(
         create_app(Settings(_env_file=None), Probe(), container=FakeContainer())
     ) as client:
@@ -36,6 +39,7 @@ def test_health_and_correlation():
 
 
 def test_protected_endpoints_require_authentication():
+    # Conversation/Document/Data 等资源端点都必须先通过认证。
     with TestClient(
         create_app(Settings(_env_file=None), Probe(), container=FakeContainer())
     ) as client:
@@ -51,6 +55,7 @@ def test_protected_endpoints_require_authentication():
 
 
 def test_health_reports_dependency_failure():
+    # 依赖不可用时 readiness 返回 503，但 liveness 探针仍应为 200。
     with TestClient(
         create_app(Settings(_env_file=None), Probe("unavailable"), container=FakeContainer())
     ) as client:

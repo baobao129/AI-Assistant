@@ -1,14 +1,13 @@
-"""Manually executed Evaluation Script (PROJECT_SPEC §15).
+"""人工执行的评估脚本（PROJECT_SPEC §15）。
 
-It runs the versioned Dataset through the real application over HTTP, asserts routing,
-Run status, Application Events, and answer grounding, and writes a Markdown Report to
-``runtime/evaluation-report.md``.
+它通过 HTTP 让真实应用跑完整的分版本 Dataset，断言 routing、Run 状态、
+Application Events 与答案接地性，并把 Markdown Report 写到
+``runtime/evaluation-report.md``。
 
     ./scripts/dev-env.ps1 | Out-Null
     uv run python -m scripts.evaluate
 
-Evaluation is not a CI-blocking gate; the Report records what was observed and which
-limitations applied.
+评估不是 CI 阻断门禁；Report 记录实际观察到的结果与所适用的限制。
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ class EvaluationRun:
         self.headers: dict[str, str] = {}
         self.conversation_id = ""
         self.document_id = ""
-        # Unique per run so a knowledge assertion cannot be ranked out by stale fixtures.
+        # 每次运行保持唯一，避免知识断言被陈旧的固定数据挤出排名。
         self.marker = f"evalmarker{uuid.uuid4().hex[:8]}"
 
     def __enter__(self) -> EvaluationRun:
@@ -84,12 +83,11 @@ class EvaluationRun:
         self.client.__exit__(None, None, None)
         self.container.close()
 
-    # Setup -----------------------------------------------------------------
+    # 准备 ---------------------------------------------------------------
     def ensure_knowledge_document(self) -> str:
-        """Index one evaluation document carrying this run's unique marker.
+        """索引一份带有本次运行唯一 marker 的评估文档。
 
-        The marker makes the Knowledge assertion independent of retrieval ranking against
-        documents accumulated by earlier runs.
+        marker 使 Knowledge 断言不受此前运行所累积文档的检索排名影响。
         """
 
         body = f"{TRAVEL_POLICY}\nRetrieval marker {self.marker} for this evaluation run.\n"
@@ -110,8 +108,8 @@ class EvaluationRun:
         job_id = upload.json()["ingestion_job_id"]
         if job_id:
             return self._await_job(job_id)
-        # A duplicate of an already known Document reuses existing state; index it if the
-        # earlier attempt never promoted a version.
+        # 已存在 Document 的重复项会复用既有状态；若早先的尝试从未提升过版本，
+        # 则对其重新索引。
         document = self.client.get(
             f"/api/v1/documents/{self.document_id}", headers=self.headers
         ).json()
@@ -137,7 +135,7 @@ class EvaluationRun:
             time.sleep(0.5)
         return status
 
-    # Execution -------------------------------------------------------------
+    # 执行 ---------------------------------------------------------------
     def run_case(self, case: EvalCase) -> CaseResult:
         if case.family == "ingestion":
             return self._ingestion_case(case)
@@ -148,7 +146,7 @@ class EvaluationRun:
         )
         if accepted.status_code != 202:
             if case.case_id == "routing-invalid-request" and accepted.status_code == 422:
-                # Blank input is rejected at the API boundary before a Run exists.
+                # 空白输入在 Run 存在之前就被 API 边界拒绝。
                 return CaseResult(
                     case,
                     True,
@@ -182,8 +180,8 @@ class EvaluationRun:
         failures: list[str] = []
         hitl_events: list[str] = []
         if case.family == "hitl":
-            # Decide the approval before asserting events: the waiting Run's stream may
-            # close at the pause point, so the terminal event appears after the decision.
+            # 先做出审批决策再断言事件：等待中的 Run 流可能在暂停点关闭，
+            # 因此终态事件会在决策之后才出现。
             failures.extend(self._hitl_checks(case, run_id, state, answer, observed))
             state = self.client.get(f"/api/v1/runs/{run_id}", headers=self.headers).json()
             observed["final_status"] = state.get("status")
@@ -248,7 +246,7 @@ class EvaluationRun:
         return events
 
     def _read_until_pause(self, run_id: str, *, deadline: float = 60.0) -> list[dict]:
-        """Wait for the Run to pause, then read its persisted event history."""
+        """等待 Run 暂停，然后读取其持久化的事件历史。"""
 
         started = time.monotonic()
         while time.monotonic() - started < deadline:
@@ -371,7 +369,7 @@ class EvaluationRun:
     def _ingestion_case(self, case: EvalCase) -> CaseResult:
         failures: list[str] = []
         observed: dict[str, object] = {}
-        # Unique content keeps the lifecycle case independent of earlier runs.
+        # 唯一内容使生命周期用例不受此前运行影响。
         title = f"evaluation-lifecycle-{uuid.uuid4().hex[:8]}.md"
         body = f"{TRAVEL_POLICY}\nLifecycle marker {uuid.uuid4().hex}\n"
         upload = self.client.post(

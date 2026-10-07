@@ -1,8 +1,7 @@
-# Non-secret defaults for live verification runs.
+# 供在线验证运行使用的非机密默认值。
 #
-# Acceptance and diagnostic scripts read these values; the real credentials always come
-# from the environment that scripts/dev-env.ps1 exports from .env. No credential is
-# hard-coded here, and no default password is assumed.
+# 验收与诊断脚本会读取这些值；真实凭据始终来自 scripts/dev-env.ps1 从 .env
+# 导出的环境变量。此处不硬编码任何凭据，也不假设任何默认密码。
 
 import os
 
@@ -19,7 +18,7 @@ LIVE_LLM_PROVIDER = "extractive"
 
 
 def live_credentials_missing() -> list[str]:
-    """Names of required live credentials that are not exported."""
+    """尚未导出的必需在线凭据名称。"""
 
     required = (
         "TEST_MYSQL_PASSWORD",

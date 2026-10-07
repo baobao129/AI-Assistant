@@ -1,7 +1,7 @@
-"""Graph path, Tool Registr, and Answer Validation boundary tests.
+"""Graph 路径、Tool Registry 与 Answer Validation 边界测试。
 
-These run against in-process stubs so they need no database, Milvus, or provider
-credential. Live equivalents live in ``scripts/verify_live.py``.
+这些用例基于进程内桩运行，无需数据库、Milvus 或 provider 凭据即可执行；
+对应的实时验证见 ``scripts/verify_live.py``。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from backend.tools.registry import ToolExecutor, ToolRegistry
 
 
 class RecordingTool:
-    """Minimal registered Tool used to observe Registry and Executor behavior."""
+    """最小可注册 Tool，用于观察 Registry 与 Executor 的行为。"""
 
     def __init__(self, tool_id: str, result: ToolResult | None = None) -> None:
         from pydantic import BaseModel, ConfigDict
@@ -60,7 +60,7 @@ def test_executor_passes_explicit_execution_context_only():
     context = ToolExecutionContext(user_id="u1", run_id="r1", authorized_document_ids=("d1",))
     executor.invoke("knowledge_search", "call-1", {"question": "policy"}, context)
     assert tool.calls[0][2] == context
-    # Graph State is never handed to a Tool.
+    # Graph State 绝不会传给 Tool。
     assert "messages" not in tool.calls[0][1]
 
 
@@ -118,7 +118,7 @@ def test_knowledge_path_without_evidence_returns_safe_outcome():
 
 def test_structured_data_tool_failure_reaches_safe_terminal_outcome():
     class QueryInput(RecordingTool):
-        """Uses the Tool Contract input so the Executor reaches the Tool."""
+        """使用 Tool Contract 定义的输入模型，使 Executor 能真正走到 Tool。"""
 
         def __init__(self) -> None:
             super().__init__("database_query")
@@ -164,6 +164,7 @@ def test_tool_loop_is_bounded_by_max_tool_iterations():
 
 
 def test_answer_validation_revision_is_bounded():
+    # 答案与检索证据无重叠时判为可重试失败，修订次数达到上限后不应再修订。
     state = initial_state(
         conversation_id="c", thread_id="t", run_id="r", user_input="policy document"
     )

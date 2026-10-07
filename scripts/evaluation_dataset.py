@@ -1,12 +1,12 @@
-"""Versioned evaluation Dataset for the manually executed evaluation run.
+"""用于人工执行评估的分版本评估 Dataset。
 
-PROJECT_SPEC §15 requires a versioned Dataset, a manually executed Script, and a Report
-covering Knowledge grounding/citations, Structured Data fidelity, General behavior,
-routing, error handling, and HITL state transitions. This module defines the Dataset.
+PROJECT_SPEC §15 要求一个分版本的 Dataset、一个人工执行的 Script 和一个 Report，
+覆盖 Knowledge 接地/引用、Structured Data 保真度、General 行为、
+routing、错误处理与 HITL 状态迁移。本模块定义该 Dataset。
 
-Each case declares the expected routing outcome, the expected terminal Run status, and
-the evidence that must appear in the Run's Application Events. ``expected`` values are
-assertions in the Report, not scoring heuristics.
+每个用例声明期望的 routing 结果、期望的终态 Run 状态，以及必须出现在
+Run 的 Application Events 中的证据。``expected`` 值是 Report 中的断言，
+而非评分启发式。
 """
 
 from __future__ import annotations

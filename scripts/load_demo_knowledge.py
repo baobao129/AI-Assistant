@@ -1,16 +1,16 @@
-"""Load the Demo Knowledge documents through the application ingestion path.
+"""通过应用 ingestion 路径加载 Demo Knowledge 文档。
 
-SELF-created Demo documents live in ``demo/knowledge``. Upload uses the same application
-service as the API, so the loader exercises the real parser, chunking, embedding, vector
-write, validation, and promotion path (PROJECT_SPEC §16).
+自建的 Demo 文档位于 ``demo/knowledge``。上传使用与 API 相同的应用服务，
+因此该加载器会走真实的 parser、切分、embedding、向量写入、校验与提升流程
+（PROJECT_SPEC §16）。
 
-Usage:
+用法：
 
     ./scripts/dev-env.ps1 | Out-Null
     uv run python -m scripts.load_demo_knowledge
 
-The loader needs a Demo user. It creates the configured bootstrap user when absent and
-otherwise reuses it (idempotent, no overwrite of existing credentials).
+该加载器需要一个 Demo 用户。当配置的 bootstrap 用户缺失时予以创建，
+否则复用（幂等，不覆盖既有凭据）。
 """
 
 from __future__ import annotations

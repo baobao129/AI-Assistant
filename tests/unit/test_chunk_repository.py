@@ -52,6 +52,7 @@ def _chunk(location: str | None) -> ChunkRecord:
 
 
 def test_over_long_location_is_explicitly_bounded_to_the_column_width():
+    # 超长的 location 必须在写入边界被截断到列宽，而不是依赖隐式假设。
     pool = RecordingPool()
     ChunkRepository(pool).add_many([_chunk("L" * 300)])
 
@@ -61,6 +62,7 @@ def test_over_long_location_is_explicitly_bounded_to_the_column_width():
 
 
 def test_short_and_null_locations_are_unchanged():
+    # 合法的短值与原样 None 不能被改写。
     pool = RecordingPool()
     ChunkRepository(pool).add_many([_chunk("chunk-7"), _chunk(None)])
 

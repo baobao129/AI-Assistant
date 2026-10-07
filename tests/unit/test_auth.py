@@ -1,4 +1,4 @@
-"""Authentication policy and Run event delivery tests."""
+"""认证策略与 Run 事件投递测试。"""
 
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ from backend.domain.identifiers import new_id, utc_now
 
 
 class FakeAuthRepository:
+    """内存版认证仓储桩，便于在不接数据库的情况下验证 AuthService 行为。"""
+
     def __init__(self) -> None:
         self.users: dict[str, UserRecord] = {}
         self.sessions: dict[str, SessionRecord] = {}
@@ -79,6 +81,7 @@ class FakeAuthRepository:
 
 
 def _service(repository: FakeAuthRepository | None = None) -> AuthService:
+    # 显式关闭 .env 读取，会话 TTL 固定为 600 秒，保证用例结果可复现。
     from backend.infrastructure.config import Settings
 
     return AuthService(
@@ -88,6 +91,7 @@ def _service(repository: FakeAuthRepository | None = None) -> AuthService:
 
 
 def test_password_hash_is_salted_and_verified():
+    # 同一口令两次加盐应得到不同摘要，且校验必须基于盐值而非明文比较。
     first, salt_a = hash_password("correct horse")
     second, salt_b = hash_password("correct horse")
     assert first != second
