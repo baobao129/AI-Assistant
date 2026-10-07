@@ -807,3 +807,53 @@ review.
 - [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md)
 - [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md)
 - [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md)
+
+## ADR-026
+
+### Title
+
+Register `answer_revision_count` in the State Contract (CC-STATE-001)
+
+### Status
+
+Accepted
+
+### Context
+
+`GRAPH_CONTRACT.md` Graph-005 / Graph-008 require the bounded revision counter for one answer
+candidate, and ADR-023 had already introduced `answer_revision_count` in Graph State while
+noting that `STATE_CONTRACT.md` did not enumerate the field in its table. ADR-023 recorded the
+required follow-up as a State/Graph Contract review under the Contract Change Protocol
+(suggested Change ID `CC-STATE-001`) instead of silently editing the Contract.
+
+### Decision
+
+Apply `CC-STATE-001` in `STATE_CONTRACT.md`:
+
+1. Add the `answer_revision_count` row to Graph Execution State with its producer, consumer,
+   mutator, candidate-local lifecycle, and Checkpoint persistence documented against the
+   implementation (`should_revise` routing predicate, `revision_update` controlled increment,
+   `ExecutionBudgets.can_revise` bound).
+2. Reference the field in the independent-counters paragraph so the declared
+   `max_answer_revisions = 1` budget and its State carrier are stated in one place.
+3. Record the Change ID, impact analysis, affected documents, tests, and consistency review
+   in the Contract's Change Record section.
+
+### Consequences
+
+The Contract, Graph Contract, and implementation now agree on the revision counter without any
+runtime, topology, Tool schema, API shape, or budget change. The previously recorded
+documentation gap is closed; `tests/integration/test_graph_paths.py` and
+`tests/integration/test_repair_budget.py` continue to cover the bounded counter behavior.
+
+### Change Conditions
+
+Changing the revision budget, reassigning ownership of the counter, or letting candidate
+regeneration create additional revision budget requires State/Graph Contract review and an
+updated Change Record entry.
+
+### Related Contracts
+
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md)
+- [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md)
+- [AGENTS.md](AGENTS.md)
