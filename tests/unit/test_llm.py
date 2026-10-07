@@ -16,9 +16,17 @@ from backend.infrastructure.llm import (
 
 
 def test_remote_is_the_default_complete_capability_profile_without_startup_connection(monkeypatch):
-    # 显式断言默认值，避免外部导出的开发 profile 改变本用例要验证的行为。
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    settings = Settings(_env_file=None, llm_provider="remote")
+    # 显式提供空密钥与默认地址：任何依赖（例如 pymilvus 导入时会把 .env 注入进程环境）
+    # 或外部导出的变量都不得让本用例触发真实网络请求。
+    for key in ("LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    settings = Settings(
+        _env_file=None,
+        llm_provider="remote",
+        llm_api_key="",
+        llm_base_url="https://api.openai.com/v1",
+        llm_model="gpt-4o-mini",
+    )
     provider = create_llm_provider(settings)
 
     assert isinstance(provider, RemoteOpenAICompatibleLLM)

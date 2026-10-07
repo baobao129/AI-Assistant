@@ -19,6 +19,21 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "live_db: requires the Compose MySQL/Milvus runtime")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_process_env():
+    """隔离进程环境，防止依赖的导入副作用泄漏到其他用例。
+
+    pymilvus 在导入时会执行 ``load_dotenv()``，把仓库 ``.env`` 注入 ``os.environ``；
+    若不隔离，先运行的集成用例会让后续单元用例看到真实 LLM/Embedding 凭据，
+    使「默认值」类断言变成对本地 .env 的隐式依赖（甚至触发真实网络请求）。
+    """
+
+    snapshot = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(snapshot)
+
+
 def _test_settings() -> Settings:
     # 固定使用 deterministic embedding 与 mock LLM，避免实时测试依赖外部 provider。
     return Settings(

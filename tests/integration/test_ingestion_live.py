@@ -35,11 +35,24 @@ def harness(live_settings):
             password=settings.auth_bootstrap_password.get_secret_value(),
             display_name=settings.auth_bootstrap_display_name,
         )
-    yield {"container": container, "user": user, "settings": settings}
+    created: list[str] = []
+    yield {"container": container, "user": user, "settings": settings, "created": created}
+    # 自清理：删除本模块创建的夹具文档并清理其向量，避免反复运行验收把共享演示语料撑大
+    # （语料膨胀会挤占检索 top_k，使不相关的验收断言偶发失败）。
+    for document_id in created:
+        try:
+            outcome = container.runtime.ingestion.submit_delete(
+                user_id=user.user_id, document_id=document_id
+            )
+            container.runtime.ingestion.process_job(outcome.ingestion_job_id)
+        except Exception as error:  # noqa: BLE001 - 清理失败不得影响测试结论
+            print(f"ingestion_fixture_cleanup_failed: {document_id[:8]} {type(error).__name__}")
     container.close()
 
 
-def _upload(container, user, *, label: str):
+def _upload(harness, *, label: str):
+    container = harness["container"]
+    user = harness["user"]
     text = document_text(label)
     payload = text.encode("utf-8")
     outcome = container.runtime.ingestion.submit_upload(
@@ -49,6 +62,8 @@ def _upload(container, user, *, label: str):
         data=payload,
     )
     assert outcome.duplicate is False, "fixture content must be unique"
+    # 登记以便模块结束时统一清理。
+    harness["created"].append(outcome.document_id)
     return outcome, payload
 
 
@@ -56,7 +71,7 @@ def _upload(container, user, *, label: str):
 def test_upload_indexes_and_promotes_the_active_version(harness):
     container = harness["container"]
     user = harness["user"]
-    outcome, payload = _upload(container, user, label="promote")
+    outcome, payload = _upload(harness, label="promote")
     assert (
         container.runtime.ingestion.process_job(outcome.ingestion_job_id, payload=payload)
         == "success"
@@ -76,7 +91,7 @@ def test_upload_indexes_and_promotes_the_active_version(harness):
 def test_duplicate_upload_reuses_the_active_document(harness):
     container = harness["container"]
     user = harness["user"]
-    outcome, payload = _upload(container, user, label="duplicate")
+    outcome, payload = _upload(harness, label="duplicate")
     assert (
         container.runtime.ingestion.process_job(outcome.ingestion_job_id, payload=payload)
         == "success"
@@ -103,7 +118,7 @@ def test_duplicate_upload_reuses_the_active_document(harness):
 def test_reindex_promotes_a_new_version_and_retires_the_old_one(harness):
     container = harness["container"]
     user = harness["user"]
-    upload, payload = _upload(container, user, label="reindex")
+    upload, payload = _upload(harness, label="reindex")
     assert (
         container.runtime.ingestion.process_job(upload.ingestion_job_id, payload=payload)
         == "success"
@@ -144,7 +159,7 @@ def test_failed_job_retry_creates_a_new_job_with_incremented_attempt(harness):
 
     container = harness["container"]
     user = harness["user"]
-    upload, payload = _upload(container, user, label="retry")
+    upload, payload = _upload(harness, label="retry")
     assert (
         container.runtime.ingestion.process_job(upload.ingestion_job_id, payload=payload)
         == "success"
@@ -188,7 +203,7 @@ def test_startup_recovery_fails_stale_running_jobs(harness):
 
     container = harness["container"]
     user = harness["user"]
-    upload, _payload = _upload(container, user, label="recovery")
+    upload, _payload = _upload(harness, label="recovery")
     job_id = upload.ingestion_job_id
     # 模拟一个 worker 已 claim 该 Job 后崩溃：claim 成功但长时间不再推进。
     assert container.runtime.jobs.claim(job_id) is True
