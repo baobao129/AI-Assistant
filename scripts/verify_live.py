@@ -131,6 +131,27 @@ def main() -> int:
                 run_state.json()["intent"] == "structured_data",
                 run_state.json()["intent"],
             )
+            # Query Result 快照必须可以追溯到产生它的那个 Run。
+            run_record = container.runtime.runs.get(run_id)
+            snapshot = (
+                container.runtime.query_results.get(run_record.query_result_id)
+                if run_record and run_record.query_result_id
+                else None
+            )
+            check(
+                "query_snapshot_traced_to_run",
+                bool(
+                    snapshot
+                    and run_record
+                    and snapshot.run_id == run_id
+                    and snapshot.user_id == run_record.user_id
+                ),
+                snapshot
+                and {
+                    "query_result_id": snapshot.query_result_id,
+                    "run_id": snapshot.run_id,
+                },
+            )
 
         # Unsafe SQL is rejected without a database side effect ------------
         unsafe = client.post(
