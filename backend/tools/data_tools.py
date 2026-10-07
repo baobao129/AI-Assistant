@@ -78,6 +78,11 @@ class KnowledgeSearchTool(RegisteredTool):
     metadata = ToolMetadata("knowledge_search", "1", "low", "knowledge_retrieval")
     input_model = KnowledgeSearchInput
 
+    # Bounded retrieval windows: `knowledge_search` is never an unbounded scan.
+    RETRIEVAL_CANDIDATE_FACTOR = 4
+    MAX_RETRIEVAL_CANDIDATES = 200
+    MAX_DOCUMENT_SCOPE = 50
+
     def __init__(
         self,
         *,
@@ -107,56 +112,103 @@ class KnowledgeSearchTool(RegisteredTool):
         if not documents:
             return self._success(tool_call_id, arguments, [], started, truncated=False)
 
-        if arguments.index_version:
-            version = self.versions.get(arguments.index_version)
-            if version is None or version.status != "active":
-                return self._rejected(
-                    tool_call_id, "index_version_not_active", "That index version is not active."
-                )
-            index_version = version.index_version
-        else:
-            index_version = documents[0].active_index_version or ""
-            if not index_version:
-                return self._success(tool_call_id, arguments, [], started, truncated=False)
-
         try:
             embedding = self.embeddings.embed(arguments.query)
         except EmbeddingProviderError as error:
             return self._failed(
                 tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
             )
+        default_collection = self._collection_for(embedding)
 
-        collection = collection_name(
-            provider=self.embeddings.provider_name,
-            model=self.embeddings.model,
-            dimension=len(embedding),
-        )
-        try:
-            matches = self.vectors.search(
-                collection=collection,
-                embedding=embedding,
-                top_k=top_k,
-                document_ids=tuple(document.document_id for document in documents),
-                index_version=index_version,
-            )
-        except VectorStoreError as error:
-            return self._failed(
-                tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
-            )
+        if arguments.index_version:
+            version = self.versions.get(arguments.index_version)
+            if version is None or version.status != "active":
+                return self._rejected(
+                    tool_call_id, "index_version_not_active", "That index version is not active."
+                )
+            targets = [(version.index_version, version.collection_name or default_collection)]
+        else:
+            # Each authorized Document is searched through its own active version, which
+            # keeps the query bounded and avoids one wide `document_id IN (...)` filter.
+            targets = []
+            for document in documents[: self.MAX_DOCUMENT_SCOPE]:
+                if not document.active_index_version:
+                    continue
+                version = self.versions.get(document.active_index_version)
+                if version is None or version.status != "active":
+                    continue
+                targets.append(
+                    (version.index_version, version.collection_name or default_collection)
+                )
+            if not targets:
+                return self._success(tool_call_id, arguments, [], started, truncated=False)
 
-        order = {match.chunk_id: match for match in matches}
-        chunks = self.chunks.list_by_ids(list(order), index_version=index_version)
+        groups = []
+        for index_version, collection in targets:
+            try:
+                groups.append(
+                    self._search(
+                        collection=collection,
+                        embedding=embedding,
+                        top_k=top_k,
+                        index_version=index_version,
+                    )
+                )
+            except VectorStoreError as error:
+                return self._failed(
+                    tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
+                )
+
+        allowed_ids = {document.document_id for document in documents}
+        merged: dict[str, float] = {}
+        for group in groups:
+            for match in group:
+                # Authorization is enforced on the returned rows as well as by the
+                # server-resolved scope, so no result can escape it.
+                if not match.document_id or match.document_id not in allowed_ids:
+                    continue
+                if match.score > merged.get(match.chunk_id, float("-inf")):
+                    merged[match.chunk_id] = match.score
+        if not merged:
+            return self._success(tool_call_id, arguments, [], started, truncated=False)
+        ranked = sorted(merged.items(), key=lambda item: item[1], reverse=True)
+
+        chunks = self.chunks.list_by_ids([chunk_id for chunk_id, _ in ranked], index_version=None)
         by_id = {chunk.chunk_id: chunk for chunk in chunks}
         results: list[dict[str, Any]] = []
-        for match in matches:
-            chunk = by_id.get(match.chunk_id)
-            if chunk is None:
+        for chunk_id, score in ranked:
+            chunk = by_id.get(chunk_id)
+            if chunk is None or chunk.document_id not in allowed_ids:
                 continue
-            results.append(self._result_item(chunk, match.score))
+            results.append(self._result_item(chunk, score))
             if len(results) >= top_k:
                 break
         truncated = len(results) >= top_k
         return self._success(tool_call_id, arguments, results, started, truncated=truncated)
+
+    def _collection_for(self, embedding: list[float]) -> str:
+        return collection_name(
+            provider=self.embeddings.provider_name,
+            model=self.embeddings.model,
+            dimension=len(embedding),
+        )
+
+    def _search(self, *, collection: str, embedding: list[float], top_k: int, index_version: str):
+        """Bounded vector search scoped by index version.
+
+        Milvus is not asked for a large ``document_id IN (...)`` expression: that
+        composite filter can under-recall on this runtime, so the query is scoped by
+        index version and authorization is enforced on the returned rows instead.
+        The candidate window stays bounded.
+        """
+
+        window = max(top_k, self.settings.max_retrieval_top_k) * self.RETRIEVAL_CANDIDATE_FACTOR
+        return self.vectors.search(
+            collection=collection,
+            embedding=embedding,
+            top_k=min(window, self.MAX_RETRIEVAL_CANDIDATES),
+            index_version=index_version,
+        )
 
     def _authorized_documents(
         self, arguments: KnowledgeSearchInput, context: ToolExecutionContext | None

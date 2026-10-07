@@ -495,15 +495,25 @@ class ChunkRepository:
                 ],
             )
 
-    def list_by_ids(self, chunk_ids: list[str], *, index_version: str) -> list[ChunkRecord]:
+    def list_by_ids(self, chunk_ids: list[str], *, index_version: str | None) -> list[ChunkRecord]:
+        """Fetch chunks by ID; ``index_version=None`` searches across versions.
+
+        Retrieval can span several active versions, so the caller passes ``None`` and
+        relies on the returned records plus its own authorization set.
+        """
+
         if not chunk_ids:
             return []
         placeholders = ", ".join(["%s"] * len(chunk_ids))
+        version_clause = "AND index_version = %s " if index_version is not None else ""
+        parameters: tuple[object, ...] = (
+            (index_version, *chunk_ids) if index_version is not None else tuple(chunk_ids)
+        )
         rows = self.pool.query(
             "SELECT chunk_id, document_id, index_version, parent_chunk_id, chunk_role, ordinal, "
-            f"content, location, label FROM document_chunks WHERE index_version = %s "
+            f"content, location, label FROM document_chunks WHERE 1 = 1 {version_clause}"
             f"AND chunk_id IN ({placeholders})",
-            (index_version, *chunk_ids),
+            parameters,
         )
         return [_chunk(row) for row in rows]
 

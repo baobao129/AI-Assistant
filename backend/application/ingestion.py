@@ -118,30 +118,16 @@ class IngestionService:
                         prior_job.status,
                         True,
                     )
-            active_jobs = [
-                job
-                for job in self.jobs.list_for_document(existing.document_id)
-                if job.status in {JOB_STATUS_PENDING, JOB_STATUS_RUNNING}
-            ]
-            if active_jobs:
-                job = active_jobs[0]
-                return UploadOutcome(
-                    existing.document_id,
-                    job.ingestion_job_id,
-                    job.index_version,
-                    job.status,
-                    True,
-                )
-            # An already indexed, available Document is reused as-is. A duplicate
-            # submission must not create an extra index version that is never promoted.
-            if existing.active_index_version:
-                return UploadOutcome(
-                    existing.document_id,
-                    "",
-                    existing.active_index_version,
-                    JOB_STATUS_SUCCESS,
-                    True,
-                )
+            # The Document already exists for this content fingerprint. A duplicate
+            # submission is answered from existing state: no second Document, no second
+            # index version, and no never-promoted version record.
+            return UploadOutcome(
+                existing.document_id,
+                "",
+                existing.active_index_version or "",
+                JOB_STATUS_SUCCESS,
+                True,
+            )
 
         document = self.documents.create(
             user_id=user_id,

@@ -17,6 +17,7 @@ import json
 import logging
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,6 +60,8 @@ class EvaluationRun:
         self.headers: dict[str, str] = {}
         self.conversation_id = ""
         self.document_id = ""
+        # Unique per run so a knowledge assertion cannot be ranked out by stale fixtures.
+        self.marker = f"evalmarker{uuid.uuid4().hex[:8]}"
 
     def __enter__(self) -> EvaluationRun:
         self.client.__enter__()
@@ -83,17 +86,19 @@ class EvaluationRun:
 
     # Setup -----------------------------------------------------------------
     def ensure_knowledge_document(self) -> str:
-        existing = self.client.get("/api/v1/documents?limit=50", headers=self.headers).json()
-        for item in existing.get("items", []):
-            if item["title"] == "evaluation-travel-policy.md" and item["active_index_version"]:
-                self.document_id = item["document_id"]
-                return "reused"
+        """Index one evaluation document carrying this run's unique marker.
+
+        The marker makes the Knowledge assertion independent of retrieval ranking against
+        documents accumulated by earlier runs.
+        """
+
+        body = f"{TRAVEL_POLICY}\nRetrieval marker {self.marker} for this evaluation run.\n"
         upload = self.client.post(
             "/api/v1/documents",
             files={
                 "file": (
                     "evaluation-travel-policy.md",
-                    TRAVEL_POLICY.encode("utf-8"),
+                    body.encode("utf-8"),
                     "text/markdown",
                 )
             },
@@ -101,17 +106,32 @@ class EvaluationRun:
         )
         if upload.status_code != 202:
             return f"upload_failed:{upload.status_code}"
-        job_id = upload.json()["ingestion_job_id"]
         self.document_id = upload.json()["document_id"]
-        return self._await_job(job_id)
+        job_id = upload.json()["ingestion_job_id"]
+        if job_id:
+            return self._await_job(job_id)
+        # A duplicate of an already known Document reuses existing state; index it if the
+        # earlier attempt never promoted a version.
+        document = self.client.get(
+            f"/api/v1/documents/{self.document_id}", headers=self.headers
+        ).json()
+        if document.get("active_index_version"):
+            return "reused"
+        reindex = self.client.post(
+            f"/api/v1/documents/{self.document_id}/reindex", headers=self.headers
+        )
+        if reindex.status_code != 202:
+            return f"reindex_failed:{reindex.status_code}"
+        return self._await_job(reindex.json()["ingestion_job_id"])
 
     def _await_job(self, job_id: str, *, deadline: float = 60.0) -> str:
         started = time.monotonic()
         status = "unknown"
         while time.monotonic() - started < deadline:
-            status = self.client.get(
-                f"/api/v1/ingestion-jobs/{job_id}", headers=self.headers
-            ).json()["status"]
+            job = self.client.get(f"/api/v1/ingestion-jobs/{job_id}", headers=self.headers)
+            if job.status_code != 200:
+                return f"lookup_failed:{job.status_code}"
+            status = job.json()["status"]
             if status in {"success", "failed"}:
                 break
             time.sleep(0.5)
@@ -123,7 +143,7 @@ class EvaluationRun:
             return self._ingestion_case(case)
         accepted = self.client.post(
             f"/api/v1/conversations/{self.conversation_id}/runs",
-            json={"user_input": case.user_input},
+            json={"user_input": case.user_input.format(marker=self.marker)},
             headers=self.headers,
         )
         if accepted.status_code != 202:
@@ -351,10 +371,12 @@ class EvaluationRun:
     def _ingestion_case(self, case: EvalCase) -> CaseResult:
         failures: list[str] = []
         observed: dict[str, object] = {}
-        title = f"evaluation-lifecycle-{int(time.time())}.md"
+        # Unique content keeps the lifecycle case independent of earlier runs.
+        title = f"evaluation-lifecycle-{uuid.uuid4().hex[:8]}.md"
+        body = f"{TRAVEL_POLICY}\nLifecycle marker {uuid.uuid4().hex}\n"
         upload = self.client.post(
             "/api/v1/documents",
-            files={"file": (title, TRAVEL_POLICY.encode("utf-8"), "text/markdown")},
+            files={"file": (title, body.encode("utf-8"), "text/markdown")},
             headers=self.headers,
         )
         observed["upload_status"] = upload.status_code

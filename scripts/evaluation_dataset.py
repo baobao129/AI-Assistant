@@ -49,14 +49,20 @@ EVAL_DATASET: tuple[EvalCase, ...] = (
         case_id="knowledge-grounded-answer",
         family="knowledge",
         title="Knowledge question is answered from indexed evidence with citations",
-        user_input="What does the travel policy document say about booking flights?",
+        user_input=(
+            "What does the travel policy document say about economy class flights for {marker}?"
+        ),
         expected_intent="knowledge",
         expected_routing_outcome="routed",
         expected_run_status="completed",
         expected_events=("agent_start", "intent", "retrieval", "citation", "final"),
         forbidden_events=("tool_call",),
         required_answer_terms=("economy",),
-        notes="Requires the Demo travel-policy document to be indexed by the evaluation setup.",
+        notes=(
+            "Requires the evaluation travel-policy document from setup. The query carries "
+            "the per-run marker so the assertion does not depend on retrieval ranking "
+            "against accumulated Demo documents."
+        ),
     ),
     EvalCase(
         case_id="knowledge-insufficient-evidence",

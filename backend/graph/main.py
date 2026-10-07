@@ -50,6 +50,69 @@ STRUCTURED_TERMS = (
 STRUCTURED_TOOL_IDS = ("database_schema", "database_query", "data_export")
 RAG_TOOL_IDS = ("knowledge_search",)
 
+# Failures that are transient and eligible for the bounded Graph repair budget
+# (`max_repair_attempts`). Security rejections, permission failures, timeouts, and
+# completed side effects are deliberately absent: they are terminal and are never
+# repaired or retried (GRAPH_CONTRACT Graph-009). Transient Tool failures are handled by
+# the owning Tool retry policy, not by this Graph repair path.
+RECOVERABLE_FAILURE_CODES: frozenset[str] = frozenset(
+    {
+        "llm_unavailable",
+        "retrieval_unavailable",
+    }
+)
+
+
+def failure(
+    code: str,
+    message: str,
+    *,
+    attempts: int = 0,
+    details: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build the bounded error envelope carried in Graph State.
+
+    ``repair_attempts`` is the counter for the Graph/Application repair budget; a new
+    Answer Validation candidate never resets it, and Resume preserves it.
+    """
+
+    return {
+        "code": code,
+        "message": message,
+        "recoverable": code in RECOVERABLE_FAILURE_CODES,
+        "repair_attempts": attempts,
+        "details": details or {},
+    }
+
+
+# Provider/store failure codes reported by the retrieval Tool are normalized to one
+# stable repair-eligible code; the original code is kept in bounded `details`.
+TRANSIENT_RETRIEVAL_CODES: frozenset[str] = frozenset(
+    {
+        "embedding_provider_unavailable",
+        "embedding_provider_missing_credentials",
+        "embedding_provider_returned_empty_vector",
+        "embedding_provider_returned_no_vector",
+        "embedding_provider_returned_wrong_count",
+        "vector_store_unavailable",
+        "vector_store_write_failed",
+        "vector_verification_failed",
+    }
+)
+
+
+def is_recoverable(state: GraphState) -> bool:
+    error = state.get("error") or {}
+    return bool(error.get("recoverable")) and str(error.get("code")) in RECOVERABLE_FAILURE_CODES
+
+
+def repair_count(state: GraphState) -> int:
+    error = state.get("error") or {}
+    try:
+        return max(0, int(error.get("repair_attempts") or 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 class ToolInvoker(Protocol):
     """Invocation boundary used by Graph nodes; it never receives Graph State."""
@@ -171,16 +234,25 @@ class RAGNodes:
             },
         )
         if result.status != "success":
-            code = result.error.code if result.error else "retrieval_failed"
-            return {
-                "error": {
-                    "code": code,
-                    "message": result.error.message if result.error else "Retrieval failed.",
+            raw_code = result.error.code if result.error else "retrieval_failed"
+            message = result.error.message if result.error else "Retrieval failed."
+            attempts = repair_count(state)
+            if result.status == "failed" and raw_code in TRANSIENT_RETRIEVAL_CODES:
+                # A transient provider/store failure is repair-eligible; a rejection
+                # such as an inactive index version is terminal.
+                return {
+                    "error": failure(
+                        "retrieval_unavailable",
+                        message,
+                        attempts=attempts,
+                        details={"reason": raw_code},
+                    )
                 }
-            }
+            return {"error": failure(raw_code, message, attempts=attempts)}
         data = result.data or {}
         results = list(data.get("results") or [])[: self.settings.max_retrieval_top_k]
         return {
+            "error": None,
             "retrieval_query": str(data.get("query") or state["user_input"]),
             "retrieval_results": results,
             "citations": [item["citation"] for item in results if "citation" in item][
@@ -230,9 +302,19 @@ class RAGNodes:
         )
         try:
             answer = self.general_llm.generate(prompt, state)
-        except Exception:  # noqa: BLE001 - provider failures become a safe outcome
-            answer = "The configured LLM could not complete the request safely."
-        return {"answer_candidate": answer, "messages": [{"role": "assistant", "content": answer}]}
+        except Exception:  # noqa: BLE001 - provider failure becomes a repair-eligible error
+            return {
+                "error": failure(
+                    "llm_unavailable",
+                    "The configured LLM could not complete the request safely.",
+                    attempts=repair_count(state),
+                )
+            }
+        return {
+            "error": None,
+            "answer_candidate": answer,
+            "messages": [{"role": "assistant", "content": answer}],
+        }
 
 
 def general_chat(state: GraphState, llm: GeneralLLM, settings: Settings) -> dict[str, object]:
@@ -243,9 +325,19 @@ def general_chat(state: GraphState, llm: GeneralLLM, settings: Settings) -> dict
     )
     try:
         answer = llm.generate(prompt[: settings.llm_max_input_chars], state)
-    except Exception:  # noqa: BLE001
-        answer = "The configured LLM could not complete the request safely."
-    return {"answer_candidate": answer, "messages": [{"role": "assistant", "content": answer}]}
+    except Exception:  # noqa: BLE001 - provider failure becomes a repair-eligible error
+        return {
+            "error": failure(
+                "llm_unavailable",
+                "The configured LLM could not complete the request safely.",
+                attempts=repair_count(state),
+            )
+        }
+    return {
+        "error": None,
+        "answer_candidate": answer,
+        "messages": [{"role": "assistant", "content": answer}],
+    }
 
 
 def sql_model_node(
@@ -263,7 +355,11 @@ def sql_model_node(
         remaining_iterations=max(0, budgets.max_tool_iterations - iterations),
     )
     if decision.error is not None:
-        return {"tool_calls": [], "error": decision.error}
+        error = dict(decision.error)
+        error.setdefault("recoverable", str(error.get("code")) in RECOVERABLE_FAILURE_CODES)
+        error.setdefault("repair_attempts", repair_count(state))
+        error.setdefault("details", {})
+        return {"tool_calls": [], "error": error}
     if decision.tool_calls:
         calls = [
             {
@@ -279,6 +375,7 @@ def sql_model_node(
         }
     answer = decision.answer or "The Structured Data path produced no answer."
     return {
+        "error": None,
         "tool_calls": [],
         "answer_candidate": answer,
         "messages": [{"role": "assistant", "content": answer}],
@@ -386,7 +483,13 @@ def response_finalize(state: GraphState) -> dict[str, object]:
     validation = state.get("answer_validation") or {}
     status = validation.get("status")
     reasons = [str(reason) for reason in (validation.get("reasons") or [])]
-    if status == "insufficient_evidence":
+    terminal_error = state.get("error") or {}
+    safe_failure = _safe_failure(str(terminal_error.get("code") or ""))
+    if safe_failure:
+        # A terminal (unrepaired) failure outcome states the real safe cause instead of a
+        # generic validation message that would hide it.
+        answer = safe_failure
+    elif status == "insufficient_evidence":
         answer = (
             "Insufficient evidence is available in the authorized knowledge sources "
             "to answer this question."
@@ -398,6 +501,24 @@ def response_finalize(state: GraphState) -> dict[str, object]:
     elif status == "validation_error":
         answer = "The answer could not be validated safely."
     return {"final_response": answer[:20000]}
+
+
+def _safe_failure(code: str) -> str | None:
+    """User-safe outcome for a terminal (unrepaired) failure code."""
+
+    if code in {"llm_unavailable", "unsupported_capability"}:
+        return (
+            "The configured language model is unavailable for this request. "
+            "The request was stopped without producing an answer."
+        )
+    if code == "retrieval_unavailable":
+        return (
+            "Knowledge retrieval is temporarily unavailable, so the request was stopped "
+            "instead of answering without authorized evidence."
+        )
+    if code == "index_version_not_active":
+        return "The requested knowledge index version is not available for retrieval."
+    return None
 
 
 def _safe_invalid_result(reasons: list[str]) -> str | None:
@@ -435,6 +556,67 @@ def _route_validation(state: GraphState, budgets: ExecutionBudgets) -> str:
     if should_revise(state, budgets):
         return "revise_knowledge" if state.get("intent") == "knowledge" else "revise_structured"
     return "response_finalize"
+
+
+def repair_guard(state: GraphState) -> dict[str, object]:
+    """Advance the repair budget and clear path results before the bounded retry.
+
+    Only a repair-eligible failure reaches this node, so the budget is consumed exactly
+    once per repair attempt and never on a security, permission, or validation outcome.
+    The counter lives in ``error.repair_attempts`` so State keeps one bounded envelope.
+    """
+
+    attempts = repair_count(state) + 1
+    return {
+        "error": {
+            "code": str((state.get("error") or {}).get("code", "unknown")),
+            "message": "Transient failure; retrying within the repair budget.",
+            "recoverable": True,
+            "repair_attempts": attempts,
+            "details": dict((state.get("error") or {}).get("details") or {}),
+        },
+        "answer_candidate": None,
+        "answer_validation": None,
+        "retrieval_results": [],
+        "context": None,
+        "citations": [],
+    }
+
+
+def _route_assembly(state: GraphState, budgets: ExecutionBudgets) -> str:
+    """Repair a transient path failure within budget, otherwise continue to validation."""
+
+    if is_recoverable(state) and budgets.can_repair(repair_count(state)):
+        return "repair"
+    return "answer_validation"
+
+
+def _route_repair(state: GraphState) -> str:
+    """Re-enter the declared stage that raised the transient failure."""
+
+    intent = state.get("intent")
+    if intent == "knowledge":
+        return "retrieval"
+    if intent == "structured_data":
+        return "model_node"
+    return "general_chat"
+
+
+def _clear_repair_error(state: GraphState) -> dict[str, object]:
+    """Drop the resolved transient failure while keeping the consumed repair budget."""
+
+    attempts = repair_count(state)
+    if not attempts:
+        return {"error": None}
+    return {
+        "error": {
+            "code": "",
+            "message": "",
+            "recoverable": False,
+            "repair_attempts": attempts,
+            "details": dict((state.get("error") or {}).get("details") or {}),
+        }
+    }
 
 
 def build_main_graph(
@@ -491,6 +673,8 @@ def build_main_graph(
     graph.add_node("tool_result_normalize", tool_result_normalize)
     graph.add_node("sql_done", lambda state: {})
     graph.add_node("revision_guard", revision_update)
+    graph.add_node("repair_guard", repair_guard)
+    graph.add_node("repair_next", _clear_repair_error)
 
     graph.add_edge(START, "request_initialize")
     graph.add_edge("request_initialize", "intent_router")
@@ -518,7 +702,32 @@ def build_main_graph(
     graph.add_edge("tool_result_normalize", "model_node")
     graph.add_edge("sql_done", "response_assembly")
     graph.add_edge("safe_response", "response_finalize")
-    graph.add_edge("response_assembly", "answer_validation")
+    graph.add_conditional_edges(
+        "response_assembly",
+        lambda state: _route_assembly(state, limits),
+        {
+            "repair": "repair_guard",
+            "answer_validation": "answer_validation",
+        },
+    )
+    graph.add_conditional_edges(
+        "repair_guard",
+        _route_repair,
+        {
+            "retrieval": "repair_next",
+            "model_node": "repair_next",
+            "general_chat": "repair_next",
+        },
+    )
+    graph.add_conditional_edges(
+        "repair_next",
+        _route_repair,
+        {
+            "retrieval": "retrieval",
+            "model_node": "model_node",
+            "general_chat": "general_chat",
+        },
+    )
     graph.add_conditional_edges(
         "answer_validation",
         lambda state: _route_validation(state, limits),

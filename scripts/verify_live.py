@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from backend.api.dependencies import build_container
@@ -161,39 +162,81 @@ def main() -> int:
             )
 
         # Knowledge ingestion and retrieval --------------------------------
+        # Unique content per run keeps the assertion deterministic: a near-duplicate of
+        # other Demo documents can legitimately be crowded out of a small top_k window.
+        marker = f"verify{uuid.uuid4().hex[:10]}"
         knowledge_text = (
-            "Enterprise Travel Policy\n\n"
-            "Employees must book economy class for flights shorter than six hours.\n\n"
-            "Expense reports are submitted within fourteen days of travel completion.\n\n"
-            "Approval by a director is required for any single expense above 5000 USD.\n"
+            f"Enterprise Travel Policy {marker}\n\n"
+            f"Employees must book economy class for flights shorter than six hours. {marker}\n\n"
+            f"Expense reports are submitted within fourteen days of travel completion. {marker}\n\n"
+            f"Approval by a director is required for any single expense above 5000 USD. {marker}\n"
         )
         upload = client.post(
             "/api/v1/documents",
-            files={"file": ("travel-policy.md", knowledge_text.encode("utf-8"), "text/markdown")},
+            files={
+                "file": (
+                    f"travel-policy-{marker}.md",
+                    knowledge_text.encode("utf-8"),
+                    "text/markdown",
+                )
+            },
             headers=headers,
         )
         check("upload_accepted", upload.status_code == 202, upload.json())
         job_status = None
         if upload.status_code == 202:
             job_id = upload.json()["ingestion_job_id"]
-            for _ in range(40):
-                job = client.get(f"/api/v1/ingestion-jobs/{job_id}", headers=headers).json()
-                job_status = job["status"]
-                if job_status in {"success", "failed"}:
-                    break
-                _sleep(client, 0.5)
+            duplicate = upload.json()["duplicate"]
+            if job_id:
+                for _ in range(40):
+                    job = client.get(f"/api/v1/ingestion-jobs/{job_id}", headers=headers).json()
+                    job_status = job["status"]
+                    if job_status in {"success", "failed"}:
+                        break
+                    _sleep(client, 0.5)
+            else:
+                # A duplicate of an already indexed Document reuses the active version,
+                # so no new Job exists and the reported status is the reused one.
+                job_status = upload.json()["status"]
+            check(
+                "upload_job_or_reuse",
+                job_status == "success",
+                {"duplicate": duplicate, "status": job_status},
+            )
             check("ingestion_succeeded", job_status == "success", job_status)
             document_id = upload.json()["document_id"]
-            documents = client.get("/api/v1/documents", headers=headers).json()["items"]
-            active = [d for d in documents if d["document_id"] == document_id]
+            # Read the Document directly so this assertion cannot be truncated by the
+            # bounded list page.
+            document = client.get(f"/api/v1/documents/{document_id}", headers=headers).json()
+            if duplicate and not document.get("active_index_version"):
+                # A reused Document that was never successfully indexed is re-indexed so
+                # the Knowledge assertions below run against a real active version.
+                reindex = client.post(f"/api/v1/documents/{document_id}/reindex", headers=headers)
+                if reindex.status_code == 202:
+                    reindex_job = reindex.json()["ingestion_job_id"]
+                    for _ in range(40):
+                        job = client.get(
+                            f"/api/v1/ingestion-jobs/{reindex_job}", headers=headers
+                        ).json()
+                        job_status = job["status"]
+                        if job_status in {"success", "failed"}:
+                            break
+                        _sleep(client, 0.5)
+                    document = client.get(
+                        f"/api/v1/documents/{document_id}", headers=headers
+                    ).json()
             check(
                 "active_index_version_promoted",
-                bool(active and active[0]["active_index_version"]),
-                active[0] if active else None,
+                bool(document.get("active_index_version")),
+                document.get("active_index_version"),
             )
             knowledge = client.post(
                 f"/api/v1/conversations/{conversation_id}/runs",
-                json={"user_input": "What does the travel policy document say about flights?"},
+                json={
+                    "user_input": (
+                        f"What does the travel policy document say about {marker} flights?"
+                    )
+                },
                 headers=headers,
             )
             if knowledge.status_code == 202:

@@ -754,3 +754,56 @@ Architecture Review and a documented migration decision.
 - [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md)
 - [API_CONTRACT.md](docs/contracts/API_CONTRACT.md)
 - [AGENTS.md](AGENTS.md)
+
+## ADR-025
+
+### Title
+
+Give `max_repair_attempts` a bounded, declared execution path in the Graph
+
+### Status
+
+Accepted
+
+### Context
+
+`GRAPH_CONTRACT.md` Graph-005 and Graph-009 require three independent counters, including
+`max_repair_attempts = 3` for "same-question automatic repairs within one Run", owned by the
+Graph/Application retry policy. The counter existed in `ExecutionBudgets` but nothing consumed
+it, so the budget was documentation rather than behavior.
+
+### Decision
+
+1. The Graph owns a bounded repair step. A repair-eligible failure leaves the path, consumes
+   exactly one repair attempt, and re-enters the declared stage that failed:
+   `knowledge -> retrieval`, `structured_data -> model_node`, `general -> general_chat`.
+2. Only genuinely transient failures are repair-eligible: `llm_unavailable` and
+   `retrieval_unavailable` (the latter normalizes transient embedding/vector-store failures).
+   Security rejections, permission failures, unsafe SQL, approval outcomes, validation
+   outcomes, and completed side effects are never repair-eligible and stay terminal.
+3. The counter is carried inside the bounded `error` envelope as `error.repair_attempts`, so
+   no new Graph State field is introduced, the counter survives Resume on the same Thread, and
+   a new Answer Validation candidate cannot reset it. Tool Loop iterations and Answer
+   Validation revisions remain separate budgets.
+4. Transient Tool-level failures remain owned by each Tool's own retry policy; the Graph
+   repair path never overrides a Tool decision.
+
+### Consequences
+
+The second mandated counter is enforced and observable. A Run with a transient provider or
+retrieval failure retries within budget instead of failing immediately, and every non-transient
+outcome keeps its previous terminal behavior. `graph/main.py` gained the `failure`,
+`is_recoverable`, `repair_count`, and `repair_guard` helpers and one `repair_guard` node with
+one conditional edge. No Core Contract limit, Tool schema, or API shape changes.
+
+### Change Conditions
+
+Changing which failures are repair-eligible, increasing the repair budget, or merging the
+repair budget with the Tool Loop or Answer Validation budgets requires Graph and Tool Contract
+review.
+
+### Related Contracts
+
+- [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md)
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md)
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md)
