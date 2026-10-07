@@ -1,8 +1,9 @@
 /**
- * API client: conversation, run, approval, document, and data-source endpoints.
- * The browser never calls a Tool directly and never sends raw SQL.
+ * API 客户端：覆盖会话、Run、Approval、Document 与 Data Source 等端点。
+ * 浏览器绝不直接调用 Tool，也绝不发送原始 SQL。
  */
 
+// 会话令牌与用户信息持久化在 localStorage 中，刷新页面后仍可恢复登录态。
 const TOKEN_KEY = 'dsh.session.token'
 const USER_KEY = 'dsh.session.user'
 
@@ -35,10 +36,12 @@ export const session = {
   },
 }
 
+// 已登录时统一附加 Authorization: Bearer 头；未登录则原样透传调用方提供的额外头。
 export function authHeaders(extra = {}) {
   return session.token ? { ...extra, Authorization: `Bearer ${session.token}` } : { ...extra }
 }
 
+// 宽容解析响应体：204 或空体返回 null，非 JSON 文本按原文返回，避免解析报错。
 async function parse(response) {
   if (response.status === 204) return null
   const text = await response.text()
@@ -62,6 +65,7 @@ export async function request(path, { method = 'GET', body, form, signal } = {})
   const response = await fetch(path, { method, headers, body: payload, signal })
   const data = await parse(response)
   if (!response.ok) {
+    // 统一把后端错误信封映射为 ApiError，并带上 X-Request-ID 便于排查。
     const error = data && data.error ? data.error : {}
     throw new ApiError(
       response.status,

@@ -21,6 +21,7 @@ async function refresh() {
   loading.value = true
   error.value = ''
   try {
+    // 健康检查与两个列表并行拉取；单个失败用 catch 降级为占位数据，避免整页报错。
     const [status, conversationPage, documentPage] = await Promise.all([
       api.health().catch((failure) => ({ status: 'degraded', services: {}, failure })),
       api.listConversations(5).catch(() => ({ items: [] })),
@@ -41,6 +42,7 @@ async function refresh() {
 
 onMounted(() => {
   refresh()
+  // 每 30s 自动刷新一次依赖状态，卸载时清理定时器。
   timer = setInterval(refresh, 30000)
 })
 onUnmounted(() => clearInterval(timer))

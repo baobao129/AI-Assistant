@@ -13,6 +13,7 @@ const router = createRouter({
   routes,
 })
 
+// 全局前置守卫：未登录访问受保护页面时重定向到 login，并带上原始路径以便登录后回跳。
 router.beforeEach((to) => {
   if (to.name === 'login') return true
   if (!session.authenticated) return { name: 'login', query: { redirect: to.fullPath } }

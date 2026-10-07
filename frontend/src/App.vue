@@ -20,7 +20,7 @@ async function signOut() {
   try {
     await api.logout()
   } catch {
-    // Logout is idempotent; a failed call still ends the local session.
+    // 登出是幂等的：即使请求失败，也仍然清理本地会话并跳转到登录页。
   } finally {
     session.clear()
     busy.value = false

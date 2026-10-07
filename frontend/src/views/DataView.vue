@@ -14,12 +14,14 @@ const busy = ref(false)
 const uploading = ref(false)
 let pollTimer = null
 
+// MVP 仅使用首个数据源，取其 data_source_id 作为后续表操作的限定范围。
 const activeSourceId = computed(() => dataSources.value[0]?.data_source_id || '')
 
 async function refresh() {
   busy.value = true
   error.value = ''
   try {
+    // 文档与数据源可并行拉取；数据源就绪后再串行获取其表清单。
     const [documentPage, sourcePage] = await Promise.all([api.listDocuments(50), api.listDataSources()])
     documents.value = documentPage.items || []
     dataSources.value = sourcePage.items || []
@@ -55,6 +57,7 @@ async function upload(event) {
   }
 }
 
+// 以 2s 间隔轮询 Ingestion Job，直到 success/failed 再刷新列表并停止轮询。
 function track(jobId) {
   clearInterval(pollTimer)
   pollTimer = setInterval(async () => {
@@ -91,6 +94,7 @@ async function reindex(documentId) {
     track(result.ingestion_job_id)
   } catch (failure) {
     error.value =
+      // 409 表示该文档已有进行中的 Ingestion Job，给出明确提示而非通用错误。
       failure instanceof ApiError && failure.status === 409
         ? 'A job is already active for this document.'
         : failure.message || 'Re-index could not be scheduled.'
@@ -101,6 +105,7 @@ async function openTable(tableName) {
   error.value = ''
   try {
     activeTable.value = await api.getTable(activeSourceId.value, tableName)
+    // 预览只取前 20 行；Data 预览有上限且不接受任意 SQL。
     preview.value = await api.previewTable(activeSourceId.value, tableName, 20)
   } catch (failure) {
     error.value = failure.message || 'The table could not be inspected.'

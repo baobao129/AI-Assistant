@@ -30,6 +30,7 @@ const threadId = ref(null)
 const transcriptEnd = ref(null)
 let stream = null
 
+// SSE 事件类型到界面标签的映射，未登记的类型回退为原始 event_type。
 const eventLabel = {
   agent_start: 'Run started',
   intent: 'Intent resolved',
@@ -60,6 +61,7 @@ async function selectConversation(conversationId) {
   events.value = []
   error.value = ''
   const page = await api.conversationMessages(conversationId, 50)
+  // 接口按时间倒序返回，这里反转成从旧到新以便自然展示。
   messages.value = (page.items || [])
     .slice()
     .reverse()
@@ -98,6 +100,7 @@ async function send() {
     listen(accepted.run_id)
   } catch (failure) {
     busy.value = false
+    // 409 表示同一 Thread 仍有运行中的请求，提示等待后再重试。
     error.value =
       failure instanceof ApiError && failure.status === 409
         ? 'This thread still has a running request. Wait for it to finish, then retry.'
@@ -105,6 +108,7 @@ async function send() {
   }
 }
 
+// 订阅指定 Run 的 SSE 事件流；切换 Run 时先关闭上一条流，避免重复副作用。
 function listen(runId) {
   stream?.close()
   stream = new RunStream(runId, {
@@ -129,6 +133,7 @@ function handleEvent(event) {
     detail: describe(event),
   })
   if (event.event_type === 'approval_required') {
+    // 记录 correlation 三要素（conversation/thread/run），Approve/Reject 时原样回传。
     pendingApproval.value = {
       approvalRequestId: event.payload.approval_request_id,
       summary: event.payload.summary || {},
@@ -201,7 +206,7 @@ async function decide(decision) {
     const result = await request
     pendingApproval.value = null
     if (decision === 'approve' && result.successor_run_id) {
-      // Approve hands off to a successor Run with its own SSE sequence.
+      // Approve 会移交到 successor Run，其拥有独立的 SSE sequence。
       threadId.value = approval.threadId
       activeRunId.value = result.successor_run_id
       listen(result.successor_run_id)

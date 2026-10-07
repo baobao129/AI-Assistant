@@ -17,11 +17,13 @@ async function submit() {
   error.value = ''
   try {
     const result = await api.login(username.value.trim(), password.value)
+    // 登录成功后持久化会话令牌与用户信息，再回跳来源页面（默认根路径）。
     session.save(result.session.token, result.user)
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     router.replace(redirect)
   } catch (failure) {
     error.value =
+      // 401 统一提示凭据无效，其余错误沿用后端消息。
       failure instanceof ApiError && failure.status === 401
         ? 'Invalid credentials.'
         : failure.message || 'Sign in failed.'
