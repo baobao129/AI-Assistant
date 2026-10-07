@@ -24,3 +24,13 @@ def checkpoint_context(
     with SqliteSaver.from_conn_string(str(path)) as saver:
         saver.setup()
         yield saver
+
+
+@contextmanager
+def open_checkpointer(
+    mode: CheckpointMode, sqlite_path: Path | str | None = None
+) -> Iterator[object]:
+    """Long-lived Checkpoint handle for a process; closed when the runtime stops."""
+
+    with checkpoint_context(mode, sqlite_path) as saver:
+        yield saver

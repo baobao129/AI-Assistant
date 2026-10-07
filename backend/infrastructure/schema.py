@@ -205,6 +205,18 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
+    CREATE TABLE IF NOT EXISTS document_contents (
+      document_id VARCHAR(36) NOT NULL PRIMARY KEY,
+      extracted_text MEDIUMTEXT NOT NULL,
+      parser_provider VARCHAR(40) NOT NULL,
+      char_count INT NOT NULL,
+      truncated TINYINT(1) NOT NULL DEFAULT 0,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      CONSTRAINT fk_contents_document FOREIGN KEY (document_id) REFERENCES documents (document_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
     CREATE TABLE IF NOT EXISTS document_chunks (
       chunk_id VARCHAR(36) NOT NULL PRIMARY KEY,
       document_id VARCHAR(36) NOT NULL,

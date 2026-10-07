@@ -13,8 +13,11 @@ from backend.infrastructure.llm import (
 )
 
 
-def test_remote_is_the_default_complete_capability_profile_without_startup_connection():
-    settings = Settings(_env_file=None)
+def test_remote_is_the_default_complete_capability_profile_without_startup_connection(monkeypatch):
+    # The default is asserted explicitly so an exported development profile cannot
+    # change what this test verifies.
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    settings = Settings(_env_file=None, llm_provider="remote")
     provider = create_llm_provider(settings)
 
     assert isinstance(provider, RemoteOpenAICompatibleLLM)

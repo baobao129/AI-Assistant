@@ -425,6 +425,45 @@ class IngestionJobRepository:
         )
 
 
+class DocumentContentRepository:
+    """Stores normalized Document text so Re-index does not depend on the original upload."""
+
+    def __init__(self, pool: MySQLConnectionPool) -> None:
+        self.pool = pool
+
+    def upsert(
+        self,
+        *,
+        document_id: str,
+        extracted_text: str,
+        parser_provider: str,
+        truncated: bool,
+    ) -> None:
+        now = utc_now()
+        self.pool.execute(
+            "INSERT INTO document_contents (document_id, extracted_text, parser_provider, "
+            "char_count, truncated, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE extracted_text = VALUES(extracted_text), "
+            "parser_provider = VALUES(parser_provider), char_count = VALUES(char_count), "
+            "truncated = VALUES(truncated), updated_at = VALUES(updated_at)",
+            (
+                document_id,
+                extracted_text,
+                parser_provider[:40],
+                len(extracted_text),
+                1 if truncated else 0,
+                now,
+                now,
+            ),
+        )
+
+    def get(self, document_id: str) -> str | None:
+        row = self.pool.query_one(
+            "SELECT extracted_text FROM document_contents WHERE document_id = %s", (document_id,)
+        )
+        return str(row[0]) if row else None
+
+
 class ChunkRepository:
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool

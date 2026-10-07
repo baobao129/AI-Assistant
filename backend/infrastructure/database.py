@@ -35,6 +35,9 @@ TIMEOUT_ERROR_CODES: frozenset[int] = frozenset({1205, 1317, 2013, 3024})
 # partial result rather than raising a driver error.
 TIMEOUT_FRACTION = 0.9
 
+# Driver fetch batch; the per-statement row limit is enforced on top of this.
+BATCH_SIZE = 100
+
 
 class DatabaseUnavailableError(RuntimeError):
     """Raised when a pooled connection cannot be produced or used."""
@@ -277,11 +280,17 @@ class ReadOnlyQueryRunner:
     def _fetch_bounded(
         self, cursor: pymysql.cursors.Cursor, *, max_rows: int
     ) -> tuple[tuple[tuple[Any, ...], ...], bool]:
+        """Read at most ``max_rows`` rows and report whether more rows were available.
+
+        The driver is asked for ``max_rows + 1`` rows so truncation is detected from the
+        result set itself instead of an unbounded extra fetch.
+        """
+
         rows: list[tuple[Any, ...]] = []
-        truncated = False
         total_bytes = 0
+        truncated = False
         while True:
-            batch = cursor.fetchmany(min(200, max_rows - len(rows) + 1))
+            batch = cursor.fetchmany(BATCH_SIZE)
             if not batch:
                 break
             for row in batch:
@@ -294,8 +303,7 @@ class ReadOnlyQueryRunner:
                 if total_bytes >= self.max_result_bytes:
                     truncated = True
                     break
-            if truncated or len(rows) >= max_rows:
-                truncated = truncated or cursor.fetchmany(1) != []
+            if truncated:
                 break
         return tuple(rows), truncated
 

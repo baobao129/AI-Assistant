@@ -15,6 +15,7 @@ dependencies = [
   "PyMySQL[rsa]==1.2.3",
   "httpx==0.28.1",
   "sqlglot==27.9.0",
+  "python-multipart==0.0.20",
 ]
 
 [dependency-groups]
@@ -31,3 +32,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI expresses dependency injection as a call in an argument default.
+"backend/api/routers/*.py" = ["B008"]
+"backend/api/main.py" = ["B008"]

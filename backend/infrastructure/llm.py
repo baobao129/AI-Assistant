@@ -162,12 +162,113 @@ class LocalOpenAICompatibleLLM(RemoteOpenAICompatibleLLM):
         return self._generate_request(user_input, require_api_key=False)
 
 
+class ExtractiveGroundedLLM:
+    """Offline development/verification reader that can only quote supplied context.
+
+    It is explicitly opt-in (``LLM_PROVIDER=extractive``) and used for local Demo and
+    acceptance runs where no provider credential is available. Because it extracts
+    sentences from the prompt's authorized context, it can never introduce enterprise
+    facts from pretrained knowledge. It does not support tool calling.
+    """
+
+    provider_name = "extractive"
+    model = "extractive-grounded"
+    capabilities = LLMCapabilities(streaming=False, structured_output=False, tool_calling=False)
+
+    CONTEXT_MARKER = "Context:"
+    QUESTION_MARKER = "Question:"
+
+    def generate(self, user_input: str, state: GraphState) -> str:
+        del state
+        context, question = self._split(user_input)
+        if not context:
+            return "insufficient evidence"
+        question_terms = _terms(question)
+        sentences = _sentences(context)
+        scored = sorted(
+            (
+                (len(question_terms & _terms(sentence)), sentence)
+                for sentence in sentences
+                if sentence.strip()
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        selected = [sentence for score, sentence in scored[:3] if score > 0]
+        if not selected:
+            # No sentence in the authorized context relates to the question.
+            return "insufficient evidence"
+        return " ".join(selected)[:2000]
+
+    @classmethod
+    def _split(cls, prompt: str) -> tuple[str, str]:
+        if cls.CONTEXT_MARKER not in prompt:
+            return "", prompt
+        after_context = prompt.split(cls.CONTEXT_MARKER, 1)[1]
+        if cls.QUESTION_MARKER in after_context:
+            context, question = after_context.split(cls.QUESTION_MARKER, 1)
+        else:
+            context, question = after_context, ""
+        return context.strip(), question.strip()
+
+
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "have",
+        "does",
+        "what",
+        "when",
+        "where",
+        "which",
+        "about",
+        "into",
+        "than",
+        "then",
+        "they",
+        "them",
+        "there",
+        "these",
+        "those",
+        "must",
+        "should",
+        "will",
+        "answer",
+        "provided",
+        "context",
+    }
+)
+
+
+def _terms(text: str) -> set[str]:
+    import re
+
+    return {
+        token for token in re.findall(r"[a-z0-9]{3,}", text.casefold()) if token not in _STOPWORDS
+    }
+
+
+def _sentences(text: str) -> list[str]:
+    import re
+
+    parts = re.split(r"(?<=[.!?;])\s+|\n+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
 def create_llm_provider(settings: Settings) -> LLMProvider:
     """Build the configured adapter without connecting to it during startup."""
 
     api_key = settings.llm_api_key.get_secret_value()
     if settings.llm_provider == "mock":
         return MockGeneralLLM()
+    if settings.llm_provider == "extractive":
+        return ExtractiveGroundedLLM()
     if settings.llm_provider == "local":
         return LocalOpenAICompatibleLLM(
             base_url=settings.local_llm_base_url,

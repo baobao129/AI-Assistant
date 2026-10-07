@@ -121,10 +121,49 @@ class QueryResultRepository:
             "DELETE FROM query_results WHERE expires_at <= %s LIMIT %s", (utc_now(), limit)
         )
 
+    def clear_run_reference(self, run_id: str) -> None:
+        """Detach a Run reference without deleting the immutable snapshot."""
+
+        self.pool.execute("UPDATE query_results SET run_id = NULL WHERE run_id = %s", (run_id,))
+
 
 class ExportArtifactRepository:
     def __init__(self, pool: MySQLConnectionPool) -> None:
         self.pool = pool
+
+    def insert_ignore(
+        self,
+        *,
+        artifact_id: str,
+        approval_request_id: str,
+        query_result_id: str,
+        user_id: str,
+        format: str,
+        row_count: int,
+        content: str,
+    ) -> bool:
+        """Create the Artifact at most once per approval request.
+
+        Returns ``True`` when this call created the row. A repeated call keeps the
+        existing row and reports ``False`` so the side effect is not repeated.
+        """
+
+        affected = self.pool.execute(
+            "INSERT IGNORE INTO export_artifacts (artifact_id, approval_request_id, "
+            "query_result_id, user_id, format, row_count, content, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                artifact_id,
+                approval_request_id,
+                query_result_id,
+                user_id,
+                format[:10],
+                row_count,
+                content,
+                utc_now(),
+            ),
+        )
+        return affected > 0
 
     def create(
         self,

@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     max_answer_revisions: int = Field(default=1, ge=0, le=1)
 
     # LLM
-    llm_provider: Literal["remote", "local", "mock"] = "remote"
+    llm_provider: Literal["remote", "local", "mock", "extractive"] = "remote"
     llm_base_url: str = "https://api.openai.com/v1"
     local_llm_base_url: str = "http://127.0.0.1:11434/v1"
     llm_api_key: SecretStr = SecretStr("")
@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     local_llm_streaming: bool = False
     local_llm_structured_output: bool = False
     local_llm_tool_calling: bool = False
+    # Structured Data Agent model selection: "auto" follows the LLM provider and uses
+    # the deterministic agent for the mock/extractive development profiles.
+    sql_agent_provider: Literal["auto", "llm", "scripted"] = "auto"
 
     # Embedding provider (SiliconFlow is the MVP remote provider)
     embedding_provider: Literal["siliconflow", "deterministic"] = "siliconflow"

@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from backend.tools.contracts import RegisteredTool, ToolError, ToolResult
+from backend.tools.contracts import RegisteredTool, ToolError, ToolExecutionContext, ToolResult
 
 
 class ToolRegistry:
@@ -24,6 +24,13 @@ class ToolRegistry:
     def list_tool_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
 
+    def disabled_tool_ids(self) -> tuple[str, ...]:
+        return tuple(
+            tool_id
+            for tool_id, tool in sorted(self._tools.items())
+            if bool(getattr(tool, "disabled", False))
+        )
+
 
 class ToolExecutor:
     """The only invocation boundary; it returns facts and never receives Graph State."""
@@ -31,11 +38,15 @@ class ToolExecutor:
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
 
-    def invoke(self, tool_id: str, tool_call_id: str, arguments: dict[str, Any]) -> ToolResult:
+    def invoke(
+        self,
+        tool_id: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         try:
             tool = self.registry.get(tool_id)
-            parsed: BaseModel = tool.input_model.model_validate(arguments)
-            return tool.execute(tool_call_id, parsed)
         except KeyError:
             return ToolResult(
                 tool_id=tool_id,
@@ -43,6 +54,16 @@ class ToolExecutor:
                 status="rejected",
                 error=ToolError(code="unknown_tool", message="Tool is not available."),
             )
+        if bool(getattr(tool, "disabled", False)):
+            return ToolResult(
+                tool_id=tool_id,
+                tool_call_id=tool_call_id,
+                status="rejected",
+                error=ToolError(code="tool_disabled", message="Tool is not available."),
+            )
+        try:
+            parsed: BaseModel = tool.input_model.model_validate(arguments)
+            return tool.execute(tool_call_id, parsed, context)
         except ValidationError:
             return ToolResult(
                 tool_id=tool_id,

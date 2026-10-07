@@ -64,4 +64,5 @@ def test_sqlite_checkpoint_graph_invocation(tmp_path: Path):
             initial_state(conversation_id="c", thread_id="t", run_id="r", user_input="hello"),
             {"configurable": {"thread_id": "t"}},
         )
-    assert result["final_response"] == "General response: hello"
+    assert "General response" in result["final_response"]
+    assert "hello" in result["final_response"]

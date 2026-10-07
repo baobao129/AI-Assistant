@@ -26,6 +26,9 @@ class GraphState(TypedDict):
     sql_validation: dict[str, object] | None
     answer_candidate: str | None
     answer_validation: dict[str, object] | None
+    # Candidate-local Answer Validation revision counter owned by the validation
+    # policy (GRAPH_CONTRACT Graph-008 / Graph-005 loop limits).
+    answer_revision_count: int
     citations: list[dict[str, object]]
     approval_request_id: str | None
     interrupt_status: InterruptStatus
@@ -54,6 +57,7 @@ def initial_state(
         "sql_validation": None,
         "answer_candidate": None,
         "answer_validation": None,
+        "answer_revision_count": 0,
         "citations": [],
         "approval_request_id": None,
         "interrupt_status": "none",

@@ -1,79 +1,66 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { Activity, CheckCircle2, CircleAlert, Database, RefreshCw, Server } from '@lucide/vue'
+import { computed, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Activity, Database, LogOut, MessagesSquare, ShieldCheck } from '@lucide/vue'
+import { api, session } from './api'
 
-const health = ref(null)
-const loading = ref(false)
-const checkedAt = ref(null)
-const error = ref('')
-const services = computed(() => [
-  { name: 'Backend', key: 'backend', icon: Server },
-  { name: 'MySQL', key: 'mysql', icon: Database },
-  { name: 'Milvus', key: 'milvus', icon: Database },
+const route = useRoute()
+const router = useRouter()
+const busy = ref(false)
+
+const user = computed(() => session.user)
+const navigation = computed(() => [
+  { name: 'dashboard', label: 'Dashboard', icon: ShieldCheck },
+  { name: 'chat', label: 'Chat', icon: MessagesSquare },
+  { name: 'data', label: 'Data', icon: Database },
 ])
-let timer
-let controller
 
-async function refresh() {
-  if (loading.value) return
-  loading.value = true
-  error.value = ''
-  controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 15000)
+async function signOut() {
+  busy.value = true
   try {
-    const response = await fetch('/api/v1/health', { signal: controller.signal })
-    const result = await response.json()
-    if (!result.services) throw new Error('Unavailable')
-    health.value = result
+    await api.logout()
   } catch {
-    health.value = null
-    error.value = 'Status unavailable'
+    // Logout is idempotent; a failed call still ends the local session.
   } finally {
-    clearTimeout(timeout)
-    checkedAt.value = new Date()
-    loading.value = false
+    session.clear()
+    busy.value = false
+    router.push({ name: 'login' })
   }
 }
-
-onMounted(() => { refresh(); timer = setInterval(refresh, 30000) })
-onUnmounted(() => { clearInterval(timer); controller?.abort() })
 </script>
 
 <template>
   <header class="topbar">
     <Activity aria-hidden="true" :size="24" />
     <span>Enterprise Multi-Source AI Agent</span>
-    <span class="environment">Development</span>
-  </header>
-  <main>
-    <div class="heading">
-      <div><p class="eyebrow">Operations</p><h1>System status</h1></div>
-      <button @click="refresh" :disabled="loading" title="Refresh status" aria-label="Refresh status">
-        <RefreshCw :size="20" :class="{ spinning: loading }" />
+    <nav v-if="session.authenticated" class="main-nav" aria-label="Primary">
+      <RouterLink
+        v-for="item in navigation"
+        :key="item.name"
+        :to="{ name: item.name }"
+        class="nav-link"
+        :class="{ active: route.name === item.name }"
+      >
+        <component :is="item.icon" :size="18" aria-hidden="true" />
+        {{ item.label }}
+      </RouterLink>
+    </nav>
+    <div class="topbar-right">
+      <span v-if="user" class="environment">{{ user.display_name }}</span>
+      <button
+        v-if="session.authenticated"
+        class="icon-button"
+        title="Sign out"
+        aria-label="Sign out"
+        :disabled="busy"
+        @click="signOut"
+      >
+        <LogOut :size="18" />
       </button>
     </div>
-    <section class="summary" aria-live="polite">
-      <CheckCircle2 v-if="health?.status === 'healthy'" :size="24" />
-      <CircleAlert v-else :size="24" />
-      <div>
-        <h2>{{ loading && !checkedAt ? 'Checking services' : error || (health?.status === 'healthy' ? 'All services operational' : 'Service attention required') }}</h2>
-        <p>{{ checkedAt ? `Last checked ${checkedAt.toLocaleTimeString()}` : 'Pending check' }}</p>
-      </div>
-    </section>
-    <section aria-labelledby="services-heading">
-      <h2 id="services-heading" class="section-title">Services</h2>
-      <ul class="service-list">
-        <li v-for="service in services" :key="service.key">
-          <component :is="service.icon" :size="22" aria-hidden="true" />
-          <span class="service-name">{{ service.name }}</span>
-          <span class="status" :class="{ healthy: health?.services[service.key] === 'healthy' }">
-            <CheckCircle2 v-if="health?.services[service.key] === 'healthy'" :size="16" />
-            <CircleAlert v-else :size="16" />
-            {{ health?.services[service.key] === 'healthy' ? 'Operational' : (loading && !checkedAt ? 'Checking' : 'Unavailable') }}
-          </span>
-        </li>
-      </ul>
-    </section>
+  </header>
+  <main :class="{ wide: route.name === 'chat' || route.name === 'data' }">
+    <RouterView />
   </main>
-  <footer>Enterprise Multi-Source AI Agent <span>Runtime monitor</span></footer>
+  <footer>Enterprise Multi-Source AI Agent <span>Internal MVP</span></footer>
 </template>

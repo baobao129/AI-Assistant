@@ -666,3 +666,91 @@ Changing the clean-environment gate or required initialization sequence requires
 - [PROJECT_SPEC.md](docs/PROJECT_SPEC.md)
 - [API_CONTRACT.md](docs/contracts/API_CONTRACT.md)
 - [AGENTS.md](AGENTS.md)
+
+## ADR-023
+
+### Title
+
+Add the Answer Validation revision counter and the offline development LLM/Embedding profiles
+
+### Status
+
+Accepted
+
+### Context
+
+`GRAPH_CONTRACT.md` (Graph-005 / Graph-008) requires `max_answer_revisions = 1` to bound the
+Answer Validation revision path for one answer candidate, but the State Contract field table
+does not enumerate a counter field for it. The MVP also needs a way to demonstrate and verify
+the Knowledge, Structured Data, HITL, and SSE paths on a machine with no provider credential.
+
+### Decision
+
+1. Add the single candidate-local counter `answer_revision_count` to Graph State, owned by the
+   Answer Validation policy and consumed only by the Graph validation routing predicate. It
+   implements the already-contracted `max_answer_revisions = 1` bound; it does not add a new
+   budget or merge the three independent counters.
+2. Add explicitly opt-in development profiles: `EMBEDDING_PROVIDER=deterministic` for
+   reproducible vectors and `LLM_PROVIDER=extractive` for a reader that can only quote
+   sentences from the authorized context. Both are selected by configuration only, never
+   inferred, and neither introduces pretrained enterprise facts. `SQL_AGENT_PROVIDER=scripted`
+   selects the deterministic Structured Data model for offline runs.
+
+### Consequences
+
+Acceptance runs are reproducible without external providers, and the Answer Validation
+revision loop is bounded by a declared State field. Production-like behavior still requires the
+remote profiles. No Core Contract limit, topology, Tool schema, or API shape changes.
+
+### Change Conditions
+
+Formalizing `answer_revision_count` in `STATE_CONTRACT.md`, or changing the revision budget,
+requires State/Graph Contract review under the Contract Change Protocol.
+
+### Related Contracts
+
+- [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md)
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md)
+- [PROJECT_SPEC.md](docs/PROJECT_SPEC.md)
+
+## ADR-024
+
+### Title
+
+Use sqlglot for SQL AST validation and python-multipart for the upload endpoint
+
+### Status
+
+Accepted
+
+### Context
+
+`TOOL_CONTRACT.md` TOOL-003 requires AST validation, a statement allowlist, multi-statement
+blocking, schema/table restriction, dangerous-function restriction, complexity controls, and
+LIMIT enforcement before any database access. String matching cannot satisfy that boundary.
+`API-007` requires `multipart/form-data` on the Document upload endpoint.
+
+### Decision
+
+- Add `sqlglot==27.9.0` (verified installed version) as the SQL parser for the SQL Validator.
+  It parses the statement, and the Validator decides allowlist, scope, complexity, LIMIT, and
+  dangerous-function policy. sqlglot is used only inside the Validator boundary.
+- Add `python-multipart==0.0.20` (verified installed version) so FastAPI can parse the upload
+  form. It performs no business logic.
+
+### Consequences
+
+The SQL boundary is enforced on a real AST rather than on text patterns. Both dependencies are
+ordinary supporting libraries with recorded reasons, versions, and impact; neither changes
+Core Contracts, State, Graph topology, Tool schemas, or API shapes.
+
+### Change Conditions
+
+Replacing the SQL parser or the multipart parser, or adding a new core dependency, requires
+Architecture Review and a documented migration decision.
+
+### Related Contracts
+
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md)
+- [API_CONTRACT.md](docs/contracts/API_CONTRACT.md)
+- [AGENTS.md](AGENTS.md)

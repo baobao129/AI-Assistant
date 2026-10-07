@@ -2,7 +2,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.tools.contracts import RegisteredTool, ToolError, ToolMetadata, ToolResult
+from backend.tools.contracts import (
+    RegisteredTool,
+    ToolError,
+    ToolExecutionContext,
+    ToolMetadata,
+    ToolResult,
+)
 from backend.tools.registry import ToolRegistry
 from backend.tools.sql_validator import ProjectSQLValidator, SQLValidator
 
@@ -45,7 +51,12 @@ class KnowledgeSearchTool(RegisteredTool):
     metadata = ToolMetadata("knowledge_search", "1", "low", "knowledge_retrieval")
     input_model = KnowledgeSearchInput
 
-    def execute(self, tool_call_id: str, arguments: KnowledgeSearchInput) -> ToolResult:
+    def execute(
+        self,
+        tool_call_id: str,
+        arguments: KnowledgeSearchInput,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         # No enterprise evidence is fabricated by the Phase 1 development stub.
         return ToolResult(
             tool_id=self.metadata.tool_id,
@@ -60,7 +71,12 @@ class DatabaseSchemaTool(RegisteredTool):
     metadata = ToolMetadata("database_schema", "1", "low", "structured_schema")
     input_model = DatabaseSchemaInput
 
-    def execute(self, tool_call_id: str, arguments: DatabaseSchemaInput) -> ToolResult:
+    def execute(
+        self,
+        tool_call_id: str,
+        arguments: DatabaseSchemaInput,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         return ToolResult(
             tool_id=self.metadata.tool_id,
             tool_call_id=tool_call_id,
@@ -81,7 +97,12 @@ class DatabaseQueryTool(RegisteredTool):
     def __init__(self, validator: SQLValidator | None = None) -> None:
         self.validator = validator or ProjectSQLValidator()
 
-    def execute(self, tool_call_id: str, arguments: DatabaseQueryInput) -> ToolResult:
+    def execute(
+        self,
+        tool_call_id: str,
+        arguments: DatabaseQueryInput,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         # The validator boundary is explicit; the Phase 1 executor has no database side effect.
         validation = self.validator.validate(arguments.sql)
         if validation.status != "accepted":
@@ -111,7 +132,12 @@ class DataExportTool(RegisteredTool):
     metadata = ToolMetadata("data_export", "1", "high", "controlled_export")
     input_model = DataExportInput
 
-    def execute(self, tool_call_id: str, arguments: DataExportInput) -> ToolResult:
+    def execute(
+        self,
+        tool_call_id: str,
+        arguments: DataExportInput,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolResult:
         # Approval is a Graph/Runtime boundary; no artifact is created in this skeleton.
         return ToolResult(
             tool_id=self.metadata.tool_id,
