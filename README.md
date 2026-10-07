@@ -122,6 +122,8 @@ filesystem, URL, Graph State, or Checkpoint endpoint.
 
 - MinerU is not deployed here; the lightweight Parser handles text, Markdown, CSV, and JSON.
 - MVP mixed Knowledge/Structured Data requests are reported as unsupported.
-- Token-level streaming is emitted only when the configured LLM profile supports it; the
+- `token` is a contract-reserved SSE event type: it stays registered in the Event
+  Contract, but the current LLM profiles generate the answer in one complete step and do
+  not publish incremental token deltas, so no `token` events are emitted today. The
   authoritative complete answer always arrives as the terminal `final` event.
 - Persistent Checkpoint is limited to the approved Memory/SQLite modes.
