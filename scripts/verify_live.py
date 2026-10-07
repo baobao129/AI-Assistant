@@ -117,6 +117,16 @@ def main() -> int:
                 {"agent_start", "intent", "tool_call", "tool_result", "final"} <= set(event_types),
                 event_types,
             )
+            # Tool 生命周期必须完整：每一次 tool_call 都要有对应的 tool_result 事件
+            # （修复 tool_results 累加语义前，除首次之外的 Tool Result 事件会缺失）。
+            check(
+                "structured_tool_events_paired",
+                event_types.count("tool_call") == event_types.count("tool_result"),
+                {
+                    "tool_calls": event_types.count("tool_call"),
+                    "tool_results": event_types.count("tool_result"),
+                },
+            )
             final = next((e for e in stream if e["event_type"] == "final"), None)
             check(
                 "structured_final",
@@ -320,6 +330,17 @@ def main() -> int:
             approval = next((e for e in stream if e["event_type"] == "approval_required"), None)
             check(
                 "approval_required_event", approval is not None, [e["event_type"] for e in stream]
+            )
+            # 等待中的 Run 事件同样必须成对：查询与导出提案各自都要有 Tool Result
+            # （修复 tool_results 累加语义前，导出提案的结果事件会缺失）。
+            hitl_types = [e["event_type"] for e in stream]
+            check(
+                "hitl_tool_events_paired",
+                hitl_types.count("tool_call") == hitl_types.count("tool_result"),
+                {
+                    "tool_calls": hitl_types.count("tool_call"),
+                    "tool_results": hitl_types.count("tool_result"),
+                },
             )
             if approval:
                 approval_request_id = approval["payload"]["approval_request_id"]

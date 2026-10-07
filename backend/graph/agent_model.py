@@ -132,6 +132,20 @@ def _bound_query_result_id(state: GraphState) -> str | None:
     return state.get("query_result_id") or None
 
 
+def _export_completed(tool_results: list[dict[str, Any]]) -> bool:
+    """是否已存在成功的 ``data_export`` 结果。
+
+    tool_results 现在按契约累加，因此 Resume 判定不能再依赖「结果列表为空」，
+    而要基于「尚无成功导出」这一幂等条件；否则恢复路径既可能漏执行导出，
+    也可能对已完成的导出重复执行。
+    """
+
+    return any(
+        result.get("tool_id") == "data_export" and result.get("status") == "success"
+        for result in tool_results
+    )
+
+
 def build_agent_messages(
     *,
     state: GraphState,
@@ -326,8 +340,13 @@ class ScriptedSQLAgentModel:
             )
         lowered = state["user_input"].casefold()
         bound_query_result_id = _bound_query_result_id(state)
-        if bound_query_result_id and "data_export" in tool_ids and not tool_results:
-            # Resume 路径：已批准的提案早已绑定好 snapshot。
+        if (
+            bound_query_result_id
+            and "data_export" in tool_ids
+            and not _export_completed(tool_results)
+        ):
+            # Resume 路径：已批准的提案早已绑定好 snapshot；只要还没有成功的导出
+            # 结果，就继续用该绑定执行一次（结果累加后不能再用「列表为空」判断）。
             return AgentDecision(
                 tool_calls=(
                     ToolCallProposal(

@@ -1,9 +1,25 @@
-from typing import Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 Intent = Literal["knowledge", "structured_data", "general"]
 RoutingOutcome = Literal["routed", "unsupported_mixed_query", "invalid_request", "routing_error"]
 CurrentPath = Literal["knowledge", "structured_data", "general"]
 InterruptStatus = Literal["none", "pending", "approved", "rejected", "expired"]
+
+# 有界追加 reducer：State 集合在合并时保留「最新 N 条」，既满足
+# GRAPH_CONTRACT Graph-006 的 append 语义（tool_results 必须累加、messages 是模型历史），
+# 又满足 STATE_CONTRACT 的「集合必须有界」要求。上限均大于单次 Run 的最大工具循环量。
+MESSAGES_LIMIT = 40
+TOOL_RESULTS_LIMIT = 24
+
+
+def bounded_add(limit: int):
+    """返回一个「追加但保留最新 limit 条」的 LangGraph reducer。"""
+
+    def reducer(left: list | None, right: list | None) -> list:
+        merged = list(left or []) + list(right or [])
+        return merged[-limit:]
+
+    return reducer
 
 
 class GraphState(TypedDict):
@@ -16,9 +32,11 @@ class GraphState(TypedDict):
     intent: Intent | None
     routing_outcome: RoutingOutcome | None
     current_path: CurrentPath | None
-    messages: list[dict[str, object]]
+    messages: Annotated[list[dict[str, object]], bounded_add(MESSAGES_LIMIT)]
+    # tool_calls 保持「替换」语义：tool_result_normalize 依赖返回 [] 清空当前建议，
+    # 追加 reducer 会让清空失效并把循环重新路由回 tool_executor。
     tool_calls: list[dict[str, object]]
-    tool_results: list[dict[str, object]]
+    tool_results: Annotated[list[dict[str, object]], bounded_add(TOOL_RESULTS_LIMIT)]
     retrieval_query: str | None
     retrieval_results: list[dict[str, object]]
     context: str | None

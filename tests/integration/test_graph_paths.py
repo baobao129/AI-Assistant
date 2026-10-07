@@ -163,6 +163,80 @@ def test_tool_loop_is_bounded_by_max_tool_iterations():
     assert result["final_response"]
 
 
+def test_tool_results_and_messages_accumulate_across_the_loop():
+    """真实模型会连续调用多个工具；State 必须按契约累加结果与消息历史。"""
+
+    # 使用真实 Tool 输入模型：与契约字段（含 source 等默认值）一致，
+    # 避免桩输入模型因缺省字段丢掉校验路径。
+    from backend.tools.data_tools import DatabaseQueryInput, DataExportInput
+
+    class QueryTool(RecordingTool):
+        """返回带 query_result_id 的成功结果，驱动脚本化模型继续提议导出。"""
+
+        def __init__(self) -> None:
+            super().__init__("database_query")
+            self.input_model = DatabaseQueryInput
+
+        def execute(self, tool_call_id, arguments, context=None):
+            return ToolResult(
+                tool_id="database_query",
+                tool_call_id=tool_call_id,
+                status="success",
+                data={
+                    "query_result_id": "qr-1",
+                    "columns": ["amount"],
+                    "rows": [[1]],
+                    "row_count": 5,
+                    "truncated": False,
+                    "query_summary": {"tables": ["sales_orders"], "duration_ms": 1},
+                },
+            )
+
+    class ExportTool(RecordingTool):
+        """返回 approval_required，模拟 HITL 提案被拒（等待人工审批）。"""
+
+        def __init__(self) -> None:
+            super().__init__("data_export")
+            self.input_model = DataExportInput
+
+        def execute(self, tool_call_id, arguments, context=None):
+            return ToolResult(
+                tool_id="data_export",
+                tool_call_id=tool_call_id,
+                status="rejected",
+                data={"approval_lifecycle": "pending", "approval_request_id": "ap-1"},
+                error=ToolError(
+                    code="approval_required", message="Approval is required before export."
+                ),
+            )
+
+    executor = ToolExecutor(ToolRegistry([QueryTool(), ExportTool()]))
+    result = build_main_graph(
+        executor=executor, settings=Settings(_env_file=None, llm_provider="mock")
+    ).invoke(
+        initial_state(
+            conversation_id="c",
+            thread_id="t",
+            run_id="r",
+            user_input="export sales amount data to csv",
+        )
+    )
+
+    # 两次工具调用 → 两条 Tool Result（修复前会被「替换」为 1 条，导致循环计数与事件缺失）。
+    assert [item["tool_id"] for item in result["tool_results"]] == [
+        "database_query",
+        "data_export",
+    ]
+    assert [item["status"] for item in result["tool_results"]] == ["success", "rejected"]
+    # 消息历史按执行顺序保留：模型建议 → 工具消息 → 模型建议 → 工具消息 → 最终回答；
+    # 之后最多再加一次有界答案修订（max_answer_revisions = 1）。
+    roles = [message.get("role") for message in result["messages"]]
+    assert roles[:5] == ["assistant", "tool", "assistant", "tool", "assistant"]
+    assert len(roles) <= 6
+    assert result["approval_request_id"] == "ap-1"
+    assert result["final_response"]
+
+
 def test_answer_validation_revision_is_bounded():
     # 答案与检索证据无重叠时判为可重试失败，修订次数达到上限后不应再修订。
     state = initial_state(
