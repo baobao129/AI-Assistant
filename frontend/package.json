@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test \"src/*.test.js\""
   },
   "dependencies": {
     "@lucide/vue": "1.52.0",
