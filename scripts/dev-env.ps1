@@ -64,6 +64,14 @@ $env:CHECKPOINT_MODE = 'sqlite'
 $env:CHECKPOINT_SQLITE_PATH = 'runtime/dev-checkpoints.sqlite'
 $env:LOG_LEVEL = 'INFO'
 
+# LangSmith 默认关闭：它不是本项目的默认运行依赖。只有 .env 显式设置
+# LANGSMITH_TRACING=true 才开启；否则宿主进程（pymilvus 的 load_dotenv 不会覆盖
+# 已存在的环境变量）也被显式置为 false，避免测试/验收运行外发 trace。
+$env:LANGSMITH_TRACING = Get-DotEnvValue 'LANGSMITH_TRACING'
+if (-not $env:LANGSMITH_TRACING) { $env:LANGSMITH_TRACING = 'false' }
+$env:LANGSMITH_ENDPOINT = Get-DotEnvValue 'LANGSMITH_ENDPOINT'
+$env:LANGSMITH_API_KEY = Get-DotEnvValue 'LANGSMITH_API_KEY'
+
 # Same values for the pytest live-database fixtures and the acceptance scripts.
 $env:TEST_MYSQL_HOST = $env:MYSQL_HOST
 $env:TEST_MYSQL_PORT = $env:MYSQL_PORT

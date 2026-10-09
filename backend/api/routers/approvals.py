@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends
 
 from backend.api.dependencies import (
@@ -13,6 +15,8 @@ from backend.api.dependencies import (
 )
 from backend.api.schemas import ApprovalDecisionRequest, ApprovalDecisionResponse
 from backend.domain.auth import AuthenticatedUser
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
@@ -35,8 +39,15 @@ def _decide(
     )
     stream_url = None
     if result.successor_run_id:
+        if not result.idempotent_replay:
+            # 只有真正完成本次批准转换的调用才调度 successor；重复 approve 绝不再次
+            # dispatch，保证同一 approval_request_id 的获批执行最多发生一次（API-006）。
+            # RunService.resume 还会以原子领取兜底，重复调度也不会产生第二次执行。
+            if not dispatcher.dispatch(
+                result.successor_run_id, approval_request_id=approval_request_id
+            ):
+                logger.warning("approval_successor_dispatch_capacity_exhausted")
         # 后继 Run 继续执行并拥有独立的 SSE 序列。
-        dispatcher.dispatch(result.successor_run_id, approval_request_id=approval_request_id)
         stream_url = f"/api/v1/runs/{result.successor_run_id}/events"
     return ApprovalDecisionResponse(
         approval_request_id=result.approval_request_id,

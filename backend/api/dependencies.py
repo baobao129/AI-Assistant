@@ -16,6 +16,7 @@ from backend.application.runtime import Runtime, build_runtime
 from backend.domain.auth import AuthenticatedUser
 from backend.domain.checkpoint import open_checkpointer
 from backend.domain.errors import authentication_error
+from backend.domain.identifiers import new_id
 from backend.infrastructure.config import Settings
 from backend.tools.registry import ToolExecutor
 from backend.workers.ingestion import IngestionWorker, MaintenanceWorker
@@ -36,6 +37,8 @@ class Container:
     tools: ToolExecutor
     ingestion_worker: IngestionWorker
     maintenance: MaintenanceWorker
+    # 有界 Run 调度器：API 与维护任务（successor 恢复）共享同一个实例。
+    dispatcher: RunDispatcher | None = None
     _checkpointer_context: object | None = field(default=None)
 
     def close(self) -> None:
@@ -64,6 +67,7 @@ def build_tool_registry(runtime: Runtime):
                 versions=runtime.versions,
                 documents=runtime.documents,
                 chunks=runtime.chunks,
+                registry=runtime.registry,
             ),
             DatabaseSchemaTool(settings=runtime.settings, query_runner=runtime.query_runner),
             DatabaseQueryTool(
@@ -107,16 +111,22 @@ def build_container(settings: Settings) -> Container:
         events=events,
         checkpointer=checkpointer,
         tool_executor=tools,
+        # 终态转换的事务边界：Run 终态与其终态事件必须同一事务提交。
+        pool=runtime.application_pool,
     )
     approvals = ApprovalService(
         approvals=runtime.approvals,
         runs=runtime.runs,
         threads=runtime.threads,
         events=events,
+        # 决策事务边界：审批 CAS、successor 创建与原始 Run 终态在同一事务内提交。
+        pool=runtime.application_pool,
     )
     ingestion_worker = IngestionWorker(runtime=runtime)
-    maintenance = MaintenanceWorker(runtime=runtime)
-    return Container(
+    maintenance = MaintenanceWorker(
+        runtime=runtime, events=events, approvals=approvals, ingestion_worker=ingestion_worker
+    )
+    container = Container(
         settings=settings,
         runtime=runtime,
         auth=auth,
@@ -128,6 +138,10 @@ def build_container(settings: Settings) -> Container:
         maintenance=maintenance,
         _checkpointer_context=checkpointer_context,
     )
+    # 有界调度器在 Container 装配完成后创建：API 与维护任务的 successor 恢复共用它。
+    container.dispatcher = RunDispatcher(container=container)
+    maintenance.dispatcher = container.dispatcher
+    return container
 
 
 def get_container(request: Request) -> Container:
@@ -170,23 +184,51 @@ class RunDispatcher:
         if not self._semaphore.acquire(blocking=False):
             logger.warning("run_dispatcher_capacity_exhausted")
             return False
+        # 执行所有权 token 由调度器生成：执行者用它领取 Run 并续租，异常兜底也用它
+        # 做条件收口，因此失去所有权的旧执行者不会误终结已被重新调度的 Run（ADR-035）。
+        owner_token = new_id()
         thread = threading.Thread(
             target=self._execute,
-            args=(run_id, approval_request_id),
+            args=(run_id, approval_request_id, owner_token),
             name=f"run-{run_id[:8]}",
             daemon=True,
         )
         thread.start()
         return True
 
-    def _execute(self, run_id: str, approval_request_id: str | None) -> None:
+    def _execute(self, run_id: str, approval_request_id: str | None, owner_token: str) -> None:
         try:
             if approval_request_id:
-                self.container.runs.resume(run_id, approval_request_id=approval_request_id)
+                self.container.runs.resume(
+                    run_id, approval_request_id=approval_request_id, owner_token=owner_token
+                )
             else:
-                self.container.runs.execute(run_id)
+                self.container.runs.execute(run_id, owner_token=owner_token)
         except Exception as error:  # noqa: BLE001 - background execution must not crash
             logger.warning("run_dispatch_failed: %s", type(error).__name__)
+            # 异常兜底：绝不允许后台执行异常留下永久 ``running``。以安全终态收口并写入
+            # 终态事件（CAS + 所有权条件，幂等：已终结或已被新执行者领取的 Run 不会被覆盖）。
+            try:
+                terminalized = self.container.runs.fail_run_safely(
+                    run_id,
+                    code="execution_failed",
+                    message="The execution could not complete safely.",
+                    required_status="running",
+                    required_owner=owner_token,
+                )
+                # An atomic claim can roll back before the Run reaches ``running``.
+                # Close that accepted intent too, while preserving CAS ownership if
+                # another dispatcher claimed it concurrently. ``accepted`` 无执行者，
+                # 因此这一步不需要（也不应带）所有权条件。
+                if not terminalized:
+                    self.container.runs.fail_run_safely(
+                        run_id,
+                        code="execution_failed",
+                        message="The execution could not complete safely.",
+                        required_status="accepted",
+                    )
+            except Exception:  # noqa: BLE001 - 兜底路径自身不得让后台线程崩溃
+                logger.warning("run_dispatch_terminalization_failed: %s", run_id)
         finally:
             self._semaphore.release()
 
@@ -197,8 +239,8 @@ class RunDispatcher:
 
 
 def get_dispatcher(request: Request) -> RunDispatcher:
-    dispatcher = getattr(request.app.state, "dispatcher", None)
-    if dispatcher is None:  # pragma: no cover
-        dispatcher = RunDispatcher(container=get_container(request))
-        request.app.state.dispatcher = dispatcher
-    return dispatcher
+    container = get_container(request)
+    # 组合根已在 Container 上装配共享实例；此处仅为手工装配的测试容器提供兜底。
+    if container.dispatcher is None:  # pragma: no cover - build_container 总会装配
+        container.dispatcher = RunDispatcher(container=container)
+    return container.dispatcher

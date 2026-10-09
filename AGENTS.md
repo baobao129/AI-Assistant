@@ -118,14 +118,16 @@ Structured Data Preview is a separate controlled Application/API read through an
 ## RAG Rules
 
 ```text
-Dense Retrieval -> Parent-Child Mapping -> Context Build -> Generation -> Answer Validation
+Dense + Chinese BM25 Retrieval -> RRF Fusion -> BGE Rerank
+-> Parent-Child Expansion (authorized, bounded) -> Context Build -> Generation -> Answer Validation
 ```
 
 1. Use `knowledge_search` through the Tool Registry and resolve active versions through the application registry.
-2. Keep retrieval/context bounded and preserve source metadata and citations.
+2. Keep retrieval/context bounded and preserve source metadata (page/section spans), evidence IDs, and citations.
 3. If sufficient, valid, authorized evidence is unavailable, return `insufficient-evidence` / safe outcome.
 4. Never use pretrained LLM knowledge to fill enterprise facts.
-5. Do not add Query Rewrite, Reranker, Hybrid Search, Planner, Supervisor, or Multi-Agent logic to MVP.
+5. V1 authorizes Chinese BM25 sparse retrieval, Dense/BM25 hybrid recall with RRF fusion, `bge-reranker-v2-m3` rerank (reusing the Embedding base URL and Secret reference, never copying keys), structured Parent/Child chunks with real parent expansion, and MinerU multi-call sharding for large files (`CR-RAG-20261009-01`, `CR-INGEST-20261009-01`). These changes require the recorded Architecture Review / Contract Change Protocol and must respect: authorization before any provider receives content; global candidate ranking within one authorized version set (never compare raw BM25 scores across collections, never drop sparse candidates by a Dense threshold before fusion); bounded rerank response validation with explicit hybrid-only degradation or safe outcome; ZIP/URL handling limited to controlled provider/storage boundaries.
+6. Still not allowed without a new approved change: Query Rewrite, Planner, Supervisor, application-level Multi-Agent orchestration, or using a chapter summary as a fact source instead of re-checking the original text.
 
 ## HITL Rules
 
@@ -149,7 +151,7 @@ proposal -> validation -> Approval Request -> Interrupt -> Checkpoint
 
 1. Use `/api/v1` and `API_CONTRACT.md` schemas.
 2. Do not expose raw Graph State, Checkpoint mutation, arbitrary SQL, arbitrary Tool invocation, arbitrary filesystem paths, or arbitrary URL fetching.
-3. Use SSE as primary streaming; do not add WebSocket for MVP.
+3. Use SSE as primary streaming; WebSocket requires an approved architecture change.
 4. SSE `sequence` starts at `1` and strictly increases within a Run.
 5. Wire format is:
 
@@ -219,4 +221,4 @@ Evidence must include exact commands, results, relevant Contract references, and
 
 ## Forbidden Patterns
 
-Do not introduce unrestricted Super Agent, Planner, Supervisor, or Multi-Agent MVP orchestration; arbitrary SQL, Tool, filesystem, URL, Graph State, or Checkpoint APIs; SQL execution bypassing Validator/read-only account; Tool execution bypassing Registry; HITL side effects before approval; infinite retries/loops/context growth; real secrets in repository artifacts; provider SDK leakage into Domain/Application Contracts; or Milvus Cluster, Kafka, Pulsar, Celery, RabbitMQ, OAuth/SSO, complete RBAC, or WebSocket MVP infrastructure without approved architecture change.
+Do not introduce unrestricted Super Agent, Planner, Supervisor, or Multi-Agent orchestration; arbitrary SQL, Tool, filesystem, URL, Graph State, or Checkpoint APIs; SQL execution bypassing Validator/read-only account; Tool execution bypassing Registry; HITL side effects before approval; infinite retries/loops/context growth; real secrets in repository artifacts; provider SDK leakage into Domain/Application Contracts; or Milvus Cluster, Kafka, Pulsar, Celery, RabbitMQ, OAuth/SSO, complete RBAC, or WebSocket infrastructure without an approved architecture change. The V1-authorized additions (Chinese BM25 hybrid retrieval, RRF, BGE rerank, MinerU multi-call sharding, large-file ingestion, structured Parent/Child expansion, full Chinese UI, real answer streaming) are allowed only under their recorded Change Records (`CR-*` / `CC-*`) and the boundaries stated in the RAG, Ingestion, and API rules above.

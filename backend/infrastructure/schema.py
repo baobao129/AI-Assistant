@@ -90,6 +90,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       user_id VARCHAR(36) NOT NULL,
       user_input TEXT NOT NULL,
       status VARCHAR(32) NOT NULL,
+      -- 执行所有权（CR-RUNTIME-20261009-01 / ADR-035）：只有持有该 token 的执行者
+      -- 才能写事件、等待态与终态；heartbeat_at 是独立心跳线程续租的权威时间戳。
+      owner_token VARCHAR(64) NULL,
+      heartbeat_at DATETIME(6) NULL,
       routing_outcome VARCHAR(32) NULL,
       intent VARCHAR(32) NULL,
       final_response MEDIUMTEXT NULL,
@@ -166,6 +170,21 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
+    CREATE TABLE IF NOT EXISTS document_files (
+      document_id VARCHAR(36) NOT NULL PRIMARY KEY,
+      storage_key VARCHAR(512) NOT NULL,
+      sha256 CHAR(64) NOT NULL,
+      byte_size BIGINT NOT NULL,
+      content_type VARCHAR(100) NOT NULL,
+      source_name VARCHAR(300) NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      KEY ix_document_files_sha (sha256),
+      CONSTRAINT fk_document_files_document
+        FOREIGN KEY (document_id) REFERENCES documents (document_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
     CREATE TABLE IF NOT EXISTS document_index_versions (
       index_version VARCHAR(36) NOT NULL PRIMARY KEY,
       document_id VARCHAR(36) NOT NULL,
@@ -192,6 +211,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       job_type VARCHAR(20) NOT NULL,
       status VARCHAR(20) NOT NULL,
       attempt INT NOT NULL DEFAULT 1,
+      -- 执行所有权（CR-RUNTIME-20261009-01 / ADR-035）：与 runs 同一套 claim/lease/心跳语义。
+      owner_token VARCHAR(64) NULL,
+      heartbeat_at DATETIME(6) NULL,
       idempotency_key VARCHAR(80) NULL,
       failure_code VARCHAR(64) NULL,
       failure_message VARCHAR(500) NULL,
@@ -218,10 +240,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS document_chunks (
-      chunk_id VARCHAR(36) NOT NULL PRIMARY KEY,
+      chunk_id VARCHAR(64) NOT NULL PRIMARY KEY,
       document_id VARCHAR(36) NOT NULL,
       index_version VARCHAR(36) NOT NULL,
-      parent_chunk_id VARCHAR(36) NULL,
+      parent_chunk_id VARCHAR(64) NULL,
       chunk_role VARCHAR(10) NOT NULL,
       ordinal INT NOT NULL,
       content MEDIUMTEXT NOT NULL,
@@ -274,6 +296,62 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
 )
 
+# Expand 迁移（ADR-035）：为既有库补充执行所有权列。
+# 每条语句幂等：先查 information_schema，缺列才执行 ALTER；重复启动不会报错，
+# 也不会改动既有数据。新列一律可空，旧行保持 NULL（读路径语义不变）。
+EXPANSION_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "runs",
+        "owner_token",
+        "ALTER TABLE runs ADD COLUMN owner_token VARCHAR(64) NULL",
+    ),
+    (
+        "runs",
+        "heartbeat_at",
+        "ALTER TABLE runs ADD COLUMN heartbeat_at DATETIME(6) NULL",
+    ),
+    (
+        "ingestion_jobs",
+        "owner_token",
+        "ALTER TABLE ingestion_jobs ADD COLUMN owner_token VARCHAR(64) NULL",
+    ),
+    (
+        "ingestion_jobs",
+        "heartbeat_at",
+        "ALTER TABLE ingestion_jobs ADD COLUMN heartbeat_at DATETIME(6) NULL",
+    ),
+)
+
+
+def _column_exists(cursor, *, table: str, column: str) -> bool:
+    cursor.execute(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (table, column),
+    )
+    row = cursor.fetchone()
+    return bool(row and int(row[0]) > 0)
+
+
+def _column_length(cursor, *, table: str, column: str) -> int | None:
+    cursor.execute(
+        "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (table, column),
+    )
+    row = cursor.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+# 列宽修正（ADR-036）：`document_chunks.chunk_id` / `parent_chunk_id` 原为 VARCHAR(36)，
+# 而 chunk ID 形如 `<32 字符 index_version>-c<ordinal>`：ordinal 达到 3 位（>99 个 child）
+# 时长度为 37，会被 MySQL 以 1406 Data too long 拒绝——长文档（P2 的目标场景）必然触发。
+# 这里只做「扩宽」：仅当现有列宽小于目标值时才执行 MODIFY，重复启动无副作用，不改数据。
+EXPANSION_WIDENINGS: tuple[tuple[str, str, str, int], ...] = (
+    ("document_chunks", "chunk_id", "VARCHAR(64) NOT NULL", 64),
+    ("document_chunks", "parent_chunk_id", "VARCHAR(64) NULL", 64),
+)
+
 
 def initialize_schema(settings: Settings) -> None:
     """使用应用账号创建缺失的表；绝不删除数据。"""
@@ -284,6 +362,15 @@ def initialize_schema(settings: Settings) -> None:
             # 逐条执行 CREATE TABLE IF NOT EXISTS：重复启动安全，只建缺失的表，不改动已有数据。
             for statement in SCHEMA_STATEMENTS:
                 cursor.execute(statement)
+            # expand 迁移：只增列，不删列、不改列；存在即跳过。
+            for table, column, statement in EXPANSION_COLUMNS:
+                if not _column_exists(cursor, table=table, column=column):
+                    cursor.execute(statement)
+            # 列宽修正：只在现有列宽不足时扩宽，绝不缩小、不改语义。
+            for table, column, definition, minimum in EXPANSION_WIDENINGS:
+                current = _column_length(cursor, table=table, column=column)
+                if current is not None and current < minimum:
+                    cursor.execute(f"ALTER TABLE {table} MODIFY COLUMN {column} {definition}")
     finally:
         pool.close()
 

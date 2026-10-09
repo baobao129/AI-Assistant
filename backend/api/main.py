@@ -5,7 +5,7 @@ Document、Ingestion 与 Structured Data API（``docs/contracts/API_CONTRACT.md`
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -46,7 +46,7 @@ def create_app(
     health_probe = probe or DependencyHealthProbe(config)
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # 应用启动时装配 Container 并拉起后台 maintenance（负责陈旧 Job 恢复等）。
         active = container or build_container(config)
         app.state.container = active

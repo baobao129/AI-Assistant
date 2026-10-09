@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 CONTENT_PREVIEW_CHARS = 2000
 
 
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """截断到 Milvus VARCHAR 的 UTF-8 字节上限，且不切断多字节字符。"""
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 class VectorStoreError(RuntimeError):
     """Milvus 无法完成所请求的向量操作。"""
 
@@ -114,16 +123,16 @@ class MilvusVectorStore:
     def upsert(self, *, collection: str, records: list[VectorRecord]) -> int:
         if not records:
             return 0
-        # 仅写入元数据预览：content/label/location 均按 Milvus VARCHAR 列宽截断。
+        # 仅写入元数据预览：Milvus VARCHAR 的 max_length 按 UTF-8 字节计数。
         rows = [
             {
                 "chunk_id": record.chunk_id,
                 "document_id": record.document_id,
                 "index_version": record.index_version,
                 "parent_chunk_id": record.parent_chunk_id or "",
-                "content": record.content[:CONTENT_PREVIEW_CHARS],
-                "label": record.label[:500],
-                "location": (record.location or "")[:250],
+                "content": _truncate_utf8(record.content, 8192),
+                "label": _truncate_utf8(record.label, 512),
+                "location": _truncate_utf8(record.location or "", 256),
                 "embedding": record.embedding,
             }
             for record in records

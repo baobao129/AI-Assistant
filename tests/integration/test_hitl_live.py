@@ -82,6 +82,25 @@ def container_run_events(client, run_id: str) -> list[dict]:
     return events
 
 
+def _read_all_events(client, run_id: str, *, deadline: float = 60.0) -> list[dict]:
+    """读取一个已终态 Run 的完整（保留窗口内）事件历史。"""
+
+    import json
+
+    events: list[dict] = []
+    started = time.monotonic()
+    with client.stream("GET", f"/api/v1/runs/{run_id}/events") as response:
+        for line in response.iter_lines():
+            if time.monotonic() - started > deadline:
+                break
+            if line.startswith("data: "):
+                event = json.loads(line[6:])
+                events.append(event)
+                if event["event_type"] in {"final", "error"}:
+                    break
+    return events
+
+
 def _approval_request_id(events: list[dict]) -> str:
     approval = next(event for event in events if event["event_type"] == "approval_required")
     return approval["payload"]["approval_request_id"]
@@ -169,3 +188,94 @@ def test_expiry_makes_the_run_expired_without_a_successor(harness):
     approval = container.runtime.approvals.get(approval_request_id)
     assert approval is not None and approval.status == "expired"
     assert approval.artifact_id is None
+
+
+@pytest.mark.live_db
+def test_approval_required_payload_carries_contract_fields_and_strict_sequence(harness):
+    # API-005：approval_required 必须携带 approval_request_id / conversation_id / thread_id /
+    # run_id / 生命周期 / 过期时间与安全的用户可见摘要；sequence 从 1 起严格递增。
+    client = harness["client"]
+    conversation_id = harness["conversation_id"]
+    run_id, _ = _start_export(client, conversation_id)
+
+    events = container_run_events(client, run_id)
+    # 服务端在补发历史后丢弃订阅通道中已补发过的 sequence，因此原始流即严格递增且不重复。
+    sequences = [event["sequence"] for event in events]
+    assert sequences == list(range(1, len(sequences) + 1))
+    assert len({event["event_id"] for event in events}) == len(events)
+
+    approval = next(event for event in events if event["event_type"] == "approval_required")
+    payload = approval["payload"]
+    assert set(payload) >= {
+        "approval_request_id",
+        "conversation_id",
+        "thread_id",
+        "run_id",
+        "approval_lifecycle",
+        "expires_at",
+        "summary",
+    }
+    assert payload["conversation_id"] == conversation_id
+    assert payload["run_id"] == run_id
+    assert payload["thread_id"] == approval["thread_id"]
+    assert payload["approval_lifecycle"] == "pending"
+    assert payload["expires_at"]
+    # 摘要只暴露用户可见的导出元数据，绝不包含完整 Graph State 或隐藏推理。
+    summary = payload["summary"]
+    assert set(summary) <= {"row_count", "columns", "format", "reason"}
+    assert "messages" not in payload and "tool_results" not in payload
+
+
+@pytest.mark.live_db
+def test_repeat_approve_does_not_dispatch_or_execute_again(harness):
+    # MAJOR 3/4：重复 approve 不再 dispatch；successor 只执行一次 export，
+    # 不重复 database_query，使用审批绑定的同一个 snapshot，且只产生一个 final。
+    client = harness["client"]
+    container = harness["container"]
+    conversation_id = harness["conversation_id"]
+    run_id, approval_request_id = _start_export(client, conversation_id)
+    detail = client.get(f"/api/v1/runs/{run_id}").json()
+    correlation = {
+        "conversation_id": conversation_id,
+        "thread_id": detail["thread_id"],
+        "run_id": run_id,
+    }
+
+    decision = client.post(f"/api/v1/approvals/{approval_request_id}/approve", json=correlation)
+    assert decision.status_code == 202, decision.text
+    successor = decision.json()["successor_run_id"]
+    assert successor
+    assert _await_status(client, successor, {"completed", "failed"}) == "completed"
+
+    successor_events = _read_all_events(client, successor)
+    tool_call_ids = [
+        event["payload"].get("tool_id")
+        for event in successor_events
+        if event["event_type"] == "tool_call"
+    ]
+    assert tool_call_ids.count("data_export") == 1
+    assert "database_query" not in tool_call_ids
+    assert [event["event_type"] for event in successor_events].count("final") == 1
+
+    # successor 使用审批绑定的不可变 snapshot，而不是重新查询出来的新快照。
+    approval = container.runtime.approvals.get(approval_request_id)
+    bound_query_result_id = approval.binding["query_result_id"]
+    original_record = container.runtime.runs.get(run_id)
+    successor_record = container.runtime.runs.get(successor)
+    assert original_record.query_result_id == bound_query_result_id
+    assert successor_record.query_result_id == bound_query_result_id
+    artifact = container.runtime.artifacts.get_by_approval(approval_request_id)
+    assert artifact is not None
+
+    # 重复 approve：返回同一 successor，且不产生第二次执行/第二个 final/第二个 artifact。
+    repeat = client.post(f"/api/v1/approvals/{approval_request_id}/approve", json=correlation)
+    assert repeat.status_code == 202
+    assert repeat.json()["successor_run_id"] == successor
+
+    after_repeat = _read_all_events(client, successor)
+    assert [event["event_type"] for event in after_repeat].count("final") == 1
+    assert [event["event_id"] for event in after_repeat] == [
+        event["event_id"] for event in successor_events
+    ]
+    again = container.runtime.artifacts.get_by_approval(approval_request_id)
+    assert again is not None and again.artifact_id == artifact.artifact_id

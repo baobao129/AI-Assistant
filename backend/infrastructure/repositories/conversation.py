@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from backend.domain.errors import ExecutionOwnershipLost
 from backend.domain.identifiers import new_id, utc_now
 from backend.infrastructure.database import MySQLConnectionPool
 
@@ -85,7 +86,10 @@ def _cursor_from(value: datetime) -> str:
 
 def _cursor_to_datetime(cursor: str) -> datetime:
     microseconds = int(cursor)
-    return datetime.utcfromtimestamp(microseconds / 1_000_000)
+    # DATETIME(6) 列使用「朴素 UTC」约定（见 domain.identifiers.utc_now），因此这里用
+    # timezone-aware 的 fromtimestamp 构造后显式去除 tzinfo：
+    # 语义与已弃用的 datetime.utcfromtimestamp 完全一致，且不触发弃用 API。
+    return datetime.fromtimestamp(microseconds / 1_000_000, tz=UTC).replace(tzinfo=None)
 
 
 class ConversationRepository:
@@ -138,7 +142,13 @@ class ConversationRepository:
         return affected > 0
 
     def touch(self, conversation_id: str) -> None:
-        self.pool.execute(
+        with self.pool.cursor() as cursor:
+            self.touch_with_cursor(cursor, conversation_id)
+
+    def touch_with_cursor(self, cursor, conversation_id: str) -> None:
+        """在调用方事务内刷新会话时间戳（与终态转换共享事务）。"""
+
+        cursor.execute(
             "UPDATE conversations SET updated_at = %s WHERE conversation_id = %s",
             (utc_now(), conversation_id),
         )
@@ -155,9 +165,40 @@ class ConversationRepository:
         citations: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> MessageRecord:
+        with self.pool.cursor() as cursor:
+            return self.add_message_with_cursor(
+                cursor,
+                conversation_id=conversation_id,
+                role=role,
+                content=content,
+                status=status,
+                run_id=run_id,
+                citations=citations,
+                metadata=metadata,
+            )
+
+    def add_message_with_cursor(
+        self,
+        cursor,
+        *,
+        conversation_id: str,
+        role: str,
+        content: str,
+        status: str,
+        run_id: str | None = None,
+        citations: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MessageRecord:
+        """在调用方事务内写入一条会话消息。
+
+        终态回答必须与终态转换同事务：只有赢得终态 CAS 的执行者才写入 assistant 消息，
+        输掉竞争的陈旧执行器不会产生重复消息（STATE：「Conversation Persistence 与
+        Application Event 分离」）。
+        """
+
         message_id = new_id()
         now = utc_now()
-        self.pool.execute(
+        cursor.execute(
             "INSERT INTO conversation_messages (message_id, conversation_id, run_id, role, "
             "content, "
             "status, citations_json, metadata_json, created_at) "
@@ -243,48 +284,22 @@ class RunRepository:
         original_run_id: str | None = None,
         approval_request_id: str | None = None,
         client_metadata: dict[str, Any] | None = None,
+        run_id: str | None = None,
     ) -> RunRecord:
-        run_id = new_id()
-        now = utc_now()
-        self.pool.execute(
-            "INSERT INTO runs (run_id, conversation_id, thread_id, user_id, user_input, status, "
-            "approval_request_id, original_run_id, predecessor_run_id, client_metadata_json, "
-            "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (
-                run_id,
-                conversation_id,
-                thread_id,
-                user_id,
-                user_input,
-                status,
-                approval_request_id,
-                original_run_id,
-                predecessor_run_id,
-                json.dumps(client_metadata or {}, ensure_ascii=False),
-                now,
-                now,
-            ),
-        )
-        return RunRecord(
-            run_id=run_id,
-            conversation_id=conversation_id,
-            thread_id=thread_id,
-            user_id=user_id,
-            user_input=user_input,
-            status=status,
-            routing_outcome=None,
-            intent=None,
-            final_response=None,
-            error_code=None,
-            error_message=None,
-            approval_request_id=approval_request_id,
-            original_run_id=original_run_id,
-            predecessor_run_id=predecessor_run_id,
-            query_result_id=None,
-            created_at=now,
-            updated_at=now,
-            completed_at=None,
-        )
+        with self.pool.cursor() as cursor:
+            return insert_run_row(
+                cursor,
+                run_id=run_id or new_id(),
+                conversation_id=conversation_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                user_input=user_input,
+                status=status,
+                predecessor_run_id=predecessor_run_id,
+                original_run_id=original_run_id,
+                approval_request_id=approval_request_id,
+                client_metadata=client_metadata,
+            )
 
     def get(self, run_id: str) -> RunRecord | None:
         row = self.pool.query_one(
@@ -303,6 +318,32 @@ class RunRepository:
         )
         return _run(row)
 
+    def claim_for_execution(self, run_id: str, *, owner_token: str) -> bool:
+        """把 ``accepted`` Run 原子地转换为 ``running`` 并记录执行所有权。
+
+        一个 Run 最多被一个执行器领取：重复 dispatch、重复 approval、已终态或正在执行的
+        Run 都不能再次执行 Graph（HITL/Resume 幂等边界）。``owner_token`` 是本次执行的
+        栅栏标识：领取之后的所有提交点都必须携带它（ADR-035）。
+        """
+
+        with self.pool.transaction() as cursor:
+            return self.claim_for_execution_with_cursor(cursor, run_id, owner_token=owner_token)
+
+    def claim_for_execution_with_cursor(self, cursor, run_id: str, *, owner_token: str) -> bool:
+        """在调用方事务内领取 ``accepted`` Run。
+
+        ``RunService`` 使用这个变体与首个 ``agent_start`` 事件共享事务，
+        使恢复预算不会漏计「领取成功后、事件发布前」的进程崩溃窗口。
+        """
+
+        now = utc_now()
+        affected = cursor.execute(
+            "UPDATE runs SET status = 'running', owner_token = %s, heartbeat_at = %s, "
+            "updated_at = %s WHERE run_id = %s AND status = 'accepted'",
+            (owner_token[:64], now, now, run_id),
+        )
+        return int(affected) > 0
+
     def update_status(
         self,
         run_id: str,
@@ -317,6 +358,49 @@ class RunRepository:
         query_result_id: str | None = None,
         terminal: bool = False,
     ) -> None:
+        with self.pool.cursor() as cursor:
+            self.update_status_with_cursor(
+                cursor,
+                run_id,
+                status,
+                routing_outcome=routing_outcome,
+                intent=intent,
+                final_response=final_response,
+                error_code=error_code,
+                error_message=error_message,
+                approval_request_id=approval_request_id,
+                query_result_id=query_result_id,
+                terminal=terminal,
+            )
+
+    def update_status_with_cursor(
+        self,
+        cursor,
+        run_id: str,
+        status: str,
+        *,
+        routing_outcome: str | None = None,
+        intent: str | None = None,
+        final_response: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        approval_request_id: str | None = None,
+        query_result_id: str | None = None,
+        terminal: bool = False,
+        required_status: str | None = None,
+        required_owner: str | None = None,
+    ) -> bool:
+        """在调用方事务内更新 Run 状态；给出 ``required_status`` 时是条件更新（CAS）。
+
+        终态转换需要与它的终态事件共享同一个事务（见 ``application.terminal``），
+        因此状态写入必须能在调用方事务的游标上执行。
+
+        ``required_owner`` 追加执行所有权条件（ADR-035）：只有仍持有本次执行 token 的
+        执行者才能写入等待态与终态——陈旧执行器即使在 ``release_stale_claim`` 之后被
+        重新调度（状态又变回 ``running``）也赢不了 CAS。写入非执行态（终态、
+        ``awaiting_approval``）时清空 token，让栅栏随执行结束一起失效。
+        """
+
         now = utc_now()
         assignments = ["status = %s", "updated_at = %s"]
         parameters: list[Any] = [status, now]
@@ -335,8 +419,96 @@ class RunRepository:
         if terminal:
             assignments.append("completed_at = %s")
             parameters.append(now)
+        if terminal or status != "running":
+            assignments.append("owner_token = NULL")
         parameters.append(run_id)
-        self.pool.execute(f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = %s", parameters)
+        clause = ""
+        if required_status is not None:
+            clause += " AND status = %s"
+            parameters.append(required_status)
+        if required_owner is not None:
+            clause += " AND owner_token = %s"
+            parameters.append(required_owner)
+        affected = cursor.execute(
+            f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = %s{clause}", parameters
+        )
+        return int(affected) > 0
+
+    def list_stale_running_successors(self, *, older_than: datetime, limit: int = 20) -> list[str]:
+        """带审批绑定、且租约已陈旧的 ``running`` successor Run。
+
+        这是进程在 Graph 执行中途退出（或执行器崩溃）后遗留的候选集合；
+        只有 HITL successor 参与「释放 + 重新调度」恢复，普通 Run 走安全终态
+        （``list_stale_running_ordinary``，见 ADR-035）。
+
+        陈旧判定基于 ``COALESCE(heartbeat_at, updated_at)``：由独立心跳线程续租的
+        ``heartbeat_at`` 是租约权威时间戳，未迁移的旧行退回 ``updated_at``。
+        """
+
+        rows = self.pool.query(
+            "SELECT run_id FROM runs WHERE status = 'running' "
+            "AND approval_request_id IS NOT NULL AND original_run_id IS NOT NULL "
+            "AND COALESCE(heartbeat_at, updated_at) < %s ORDER BY updated_at ASC LIMIT %s",
+            (older_than, limit),
+        )
+        return [str(row[0]) for row in rows]
+
+    def list_stale_running_ordinary(self, *, older_than: datetime, limit: int = 20) -> list[str]:
+        """没有审批绑定的 ``running`` Run（普通 Run）中租约已陈旧的候选集合。
+
+        普通 Run 没有可用的「已批准续跑」入口，重新调度会把整个 Graph 再执行一遍，
+        因此它们不会被释放重跑，而是被安全终止（``execution_interrupted``）。
+        """
+
+        rows = self.pool.query(
+            "SELECT run_id FROM runs WHERE status = 'running' "
+            "AND approval_request_id IS NULL AND original_run_id IS NULL "
+            "AND COALESCE(heartbeat_at, updated_at) < %s ORDER BY updated_at ASC LIMIT %s",
+            (older_than, limit),
+        )
+        return [str(row[0]) for row in rows]
+
+    def release_stale_claim(self, run_id: str, *, older_than: datetime) -> bool:
+        """把陈旧的 ``running`` successor 原子地转回 ``accepted``（可重新调度）。
+
+        双重条件（状态 + 陈旧时间）保证：只有确实超过陈旧阈值的执行声明才会被释放，
+        仍在正常执行（独立心跳持续刷新 ``heartbeat_at``）的 Run 不会被误释放。
+        释放同时清空 ``owner_token``：被释放的执行者随之失去所有权，不能再写事件、
+        等待态或终态（ADR-035 的栅栏语义）。
+        """
+
+        affected = self.pool.execute(
+            "UPDATE runs SET status = 'accepted', owner_token = NULL, updated_at = %s "
+            "WHERE run_id = %s AND status = 'running' "
+            "AND COALESCE(heartbeat_at, updated_at) < %s",
+            (utc_now(), run_id, older_than),
+        )
+        return affected > 0
+
+    def heartbeat(self, run_id: str, *, owner_token: str) -> bool:
+        """执行期续租：仅当 Run 仍是 ``running`` 且仍由该 token 持有时推进租约。
+
+        心跳把「最近一次可见执行活动」写到 Run 行上，使维护任务的陈旧判定基于
+        执行者的活跃证据，而不是仅凭领取时刻；终态 Run 不会被心跳复活，
+        已失去所有权的执行者也续不了租（返回 ``False``）。
+        """
+
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE runs SET heartbeat_at = %s, updated_at = %s "
+            "WHERE run_id = %s AND status = 'running' AND owner_token = %s",
+            (now, now, run_id, owner_token),
+        )
+        return affected > 0
+
+    def is_owned_by(self, run_id: str, *, owner_token: str) -> bool:
+        """该 Run 是否仍处于 ``running`` 且仍归属于该执行 token（提交点校验用）。"""
+
+        row = self.pool.query_one(
+            "SELECT 1 FROM runs WHERE run_id = %s AND status = 'running' AND owner_token = %s",
+            (run_id, owner_token),
+        )
+        return row is not None
 
     def list_for_conversation(self, conversation_id: str, *, limit: int = 20) -> list[RunRecord]:
         rows = self.pool.query(
@@ -345,6 +517,124 @@ class RunRepository:
             (conversation_id, limit),
         )
         return [record for row in rows if (record := _run(row)) is not None]
+
+
+def reserve_event_with_cursor(
+    cursor,
+    *,
+    run_id: str,
+    event_id: str,
+    event_type: str,
+    thread_id: str,
+    payload: dict[str, Any],
+    created_at: datetime | None = None,
+    required_owner: str | None = None,
+) -> int:
+    """在调用方事务内预留该 Run 的下一个 sequence 并写入事件，返回 sequence。
+
+    幂等：``run_events`` 对 ``event_id`` 与 ``(run_id, sequence)`` 都有唯一键，
+    同一 ``event_id`` 重复写入时直接返回既有 sequence，不会产生第二条事件。
+
+    ``required_owner`` 给出时是执行期提交点校验（ADR-035）：锁住 Run 行后确认它仍是
+    本次执行的 ``running`` 且仍由该 token 持有，否则抛 ``ExecutionOwnershipLost`` 且
+    不写入任何事件行——失去所有权的执行者不得再向该 Run 的事件流追加内容。
+    """
+
+    cursor.execute(
+        "SELECT sequence FROM run_events WHERE run_id = %s AND event_id = %s",
+        (run_id, event_id),
+    )
+    existing = cursor.fetchone()
+    if existing is not None:
+        return int(existing[0])
+    # 锁住 Run 行，使并发发布者绝不会被分配到相同的 sequence。
+    cursor.execute("SELECT status, owner_token FROM runs WHERE run_id = %s FOR UPDATE", (run_id,))
+    run_row = cursor.fetchone()
+    if run_row is None:
+        raise KeyError(run_id)
+    if required_owner is not None and (
+        str(run_row[0]) != "running" or run_row[1] != required_owner
+    ):
+        raise ExecutionOwnershipLost(run_id)
+    cursor.execute(
+        "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE run_id = %s",
+        (run_id,),
+    )
+    row = cursor.fetchone()
+    sequence = (int(row[0]) if row else 0) + 1
+    cursor.execute(
+        "INSERT INTO run_events (run_id, sequence, event_id, event_type, "
+        "thread_id, payload_json, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (
+            run_id,
+            sequence,
+            event_id,
+            event_type,
+            thread_id,
+            json.dumps(payload, ensure_ascii=False),
+            created_at or utc_now(),
+        ),
+    )
+    return sequence
+
+
+def insert_run_row(
+    cursor,
+    *,
+    run_id: str,
+    conversation_id: str,
+    thread_id: str,
+    user_id: str,
+    user_input: str,
+    status: str,
+    predecessor_run_id: str | None = None,
+    original_run_id: str | None = None,
+    approval_request_id: str | None = None,
+    client_metadata: dict[str, Any] | None = None,
+) -> RunRecord:
+    """在给定游标上插入一条 Run（供普通创建与 HITL 事务共用同一列定义）。"""
+
+    now = utc_now()
+    cursor.execute(
+        "INSERT INTO runs (run_id, conversation_id, thread_id, user_id, user_input, status, "
+        "approval_request_id, original_run_id, predecessor_run_id, client_metadata_json, "
+        "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            run_id,
+            conversation_id,
+            thread_id,
+            user_id,
+            user_input,
+            status,
+            approval_request_id,
+            original_run_id,
+            predecessor_run_id,
+            json.dumps(client_metadata or {}, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    return RunRecord(
+        run_id=run_id,
+        conversation_id=conversation_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        user_input=user_input,
+        status=status,
+        routing_outcome=None,
+        intent=None,
+        final_response=None,
+        error_code=None,
+        error_message=None,
+        approval_request_id=approval_request_id,
+        original_run_id=original_run_id,
+        predecessor_run_id=predecessor_run_id,
+        query_result_id=None,
+        created_at=now,
+        updated_at=now,
+        completed_at=None,
+    )
 
 
 class RunEventRepository:
@@ -362,47 +652,60 @@ class RunEventRepository:
         thread_id: str,
         payload: dict[str, Any],
         created_at: datetime | None = None,
+        required_owner: str | None = None,
     ) -> int:
         """以原子方式预留该 Run 的下一个 sequence 并持久化事件。
 
         全程锁住 Run 行，因此并发的发布者（例如前驱 Run 尚未收尾时启动的后继 Run）
-        绝不会被分配到相同的 ``sequence``。
+        绝不会被分配到相同的 ``sequence``。``required_owner`` 是执行期提交点校验
+        （ADR-035）：失去所有权的执行者拿不到 sequence，也写不进事件。
         """
 
-        with self.pool.connection() as connection:
-            connection.begin()
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT run_id FROM runs WHERE run_id = %s FOR UPDATE", (run_id,)
-                    )
-                    if cursor.fetchone() is None:
-                        raise KeyError(run_id)
-                    cursor.execute(
-                        "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE run_id = %s",
-                        (run_id,),
-                    )
-                    row = cursor.fetchone()
-                    sequence = (int(row[0]) if row else 0) + 1
-                    cursor.execute(
-                        "INSERT INTO run_events (run_id, sequence, event_id, event_type, "
-                        "thread_id, payload_json, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (
-                            run_id,
-                            sequence,
-                            event_id,
-                            event_type,
-                            thread_id,
-                            json.dumps(payload, ensure_ascii=False),
-                            created_at or utc_now(),
-                        ),
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        return sequence
+        with self.pool.transaction() as cursor:
+            return reserve_event_with_cursor(
+                cursor,
+                run_id=run_id,
+                event_id=event_id,
+                event_type=event_type,
+                thread_id=thread_id,
+                payload=payload,
+                created_at=created_at,
+                required_owner=required_owner,
+            )
+
+    def reserve_with_cursor(
+        self,
+        cursor,
+        *,
+        run_id: str,
+        event_id: str,
+        event_type: str,
+        thread_id: str,
+        payload: dict[str, Any],
+        created_at: datetime | None = None,
+        required_owner: str | None = None,
+    ) -> int:
+        """在调用方事务内预留 sequence 并写入事件（供终态事件的原子写入使用）。"""
+
+        return reserve_event_with_cursor(
+            cursor,
+            run_id=run_id,
+            event_id=event_id,
+            event_type=event_type,
+            thread_id=thread_id,
+            payload=payload,
+            created_at=created_at,
+            required_owner=required_owner,
+        )
+
+    def count_of_type(self, *, run_id: str, event_type: str) -> int:
+        """该 Run 已持久化的某类事件数量（判定执行尝试次数等有界恢复条件）。"""
+
+        row = self.pool.query_one(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = %s AND event_type = %s",
+            (run_id, event_type),
+        )
+        return int(row[0]) if row else 0
 
     def list_after(
         self, *, run_id: str, after_event_id: str | None

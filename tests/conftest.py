@@ -36,8 +36,13 @@ def _isolated_process_env():
 
 def _test_settings() -> Settings:
     # 固定使用 deterministic embedding 与 mock LLM，避免实时测试依赖外部 provider。
+    # 同时显式固定内存 Checkpoint：部署档位默认 sqlite（ADR-035）且其路径是**容器内**
+    # 路径（/app/runtime/...，经 .env 注入进程环境），宿主直跑测试若继承它会在
+    # Windows 上解析成 C:\app\... 而失败；初始化参数优先于环境变量，因此这里显式固定。
+    # sqlite 档位本身由 tests/unit/test_checkpoint.py 与 tests/integration/test_graph.py 覆盖。
     return Settings(
         _env_file=None,
+        checkpoint_mode="memory",
         mysql_host=os.environ.get("TEST_MYSQL_HOST", "127.0.0.1"),
         mysql_port=int(os.environ.get("TEST_MYSQL_PORT", "13306")),
         mysql_user=os.environ.get("TEST_MYSQL_USER", "agent_app"),

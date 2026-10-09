@@ -21,10 +21,27 @@ class FakeRunEventRepository:
     def __init__(self) -> None:
         self.rows: dict[str, list[tuple[str, int, str, str, dict, object]]] = {}
         self.trimmed: list[tuple[str, int]] = []
+        # ``run_id -> 当前 owner_token``（None 表示无执行者持有）。给出 required_owner
+        # 时模拟真实存储的所有权条件：不匹配即拒绝写入（ADR-035）。
+        self.owners: dict[str, str | None] = {}
 
-    def append(self, *, run_id, event_id, event_type, thread_id, payload, created_at=None) -> int:
+    def append(
+        self,
+        *,
+        run_id,
+        event_id,
+        event_type,
+        thread_id,
+        payload,
+        created_at=None,
+        required_owner=None,
+    ) -> int:
         """预留该 Run 的下一个 sequence，模拟 SQL ``FOR UPDATE`` 的加锁语义。"""
 
+        if required_owner is not None and self.owners.get(run_id) != required_owner:
+            from backend.domain.errors import ExecutionOwnershipLost
+
+            raise ExecutionOwnershipLost(run_id)
         rows = self.rows.setdefault(run_id, [])
         sequence = max((int(row[1]) for row in rows), default=0) + 1
         rows.append((event_id, sequence, event_type, thread_id, payload, created_at))
@@ -162,6 +179,40 @@ def test_publish_never_blocks_when_no_subscriber_exists():
     envelope = publisher.publish(run_id="r1", thread_id="t1", event_type="final", payload={})
     assert envelope.sequence == 1
     assert publisher.is_stream_closed("r1") is True
+
+
+def test_execution_event_requires_the_current_owner():
+    """执行期事件是所有权条件的提交点（ADR-035）：失去所有者写不进任何事件。"""
+
+    from backend.domain.errors import ExecutionOwnershipLost
+
+    publisher, repository = _publisher()
+    repository.owners["r1"] = "owner-a"
+    owned = publisher.publish(
+        run_id="r1",
+        thread_id="t1",
+        event_type="intent",
+        payload={"intent": "general"},
+        owner_token="owner-a",
+    )
+    assert owned.sequence == 1
+    with pytest.raises(ExecutionOwnershipLost):
+        publisher.publish(
+            run_id="r1",
+            thread_id="t1",
+            event_type="intent",
+            payload={"intent": "general"},
+            owner_token="owner-b",
+        )
+    # 被拒绝的写入不占用 sequence，也不产生事件行。
+    assert len(repository.rows["r1"]) == 1
+    # 管理/审批路径（不给出 token）不受执行所有权约束。
+    assert (
+        publisher.publish(
+            run_id="r1", thread_id="t1", event_type="final", payload={"status": "completed"}
+        ).sequence
+        == 2
+    )
 
 
 _ = queue

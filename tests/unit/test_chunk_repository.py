@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 from backend.infrastructure.repositories.documents import (
@@ -33,7 +33,7 @@ class RecordingPool:
         self.recorded = RecordingCursor()
 
     @contextmanager
-    def cursor(self) -> Iterator[RecordingCursor]:
+    def cursor(self) -> Generator[RecordingCursor, None, None]:
         yield self.recorded
 
 

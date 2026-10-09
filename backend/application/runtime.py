@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from backend.application.index_registry import IndexRegistry
 from backend.application.ingestion import IngestionService
@@ -19,6 +20,7 @@ from backend.infrastructure.database import (
     ReadOnlyQueryRunner,
 )
 from backend.infrastructure.embedding import EmbeddingProvider, create_embedding_provider
+from backend.infrastructure.file_storage import ManagedUploadStorage
 from backend.infrastructure.parsers import DocumentParser, create_parser
 from backend.infrastructure.repositories.approvals import ApprovalRepository
 from backend.infrastructure.repositories.auth import AuthRepository
@@ -31,6 +33,7 @@ from backend.infrastructure.repositories.conversation import (
 from backend.infrastructure.repositories.documents import (
     ChunkRepository,
     DocumentContentRepository,
+    DocumentFileRepository,
     DocumentRepository,
     IndexVersionRepository,
     IngestionJobRepository,
@@ -59,6 +62,8 @@ class Runtime:
     approvals: ApprovalRepository
     documents: DocumentRepository
     document_contents: DocumentContentRepository
+    document_files: DocumentFileRepository
+    upload_storage: ManagedUploadStorage
     versions: IndexVersionRepository
     chunks: ChunkRepository
     jobs: IngestionJobRepository
@@ -109,6 +114,11 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
     approvals = ApprovalRepository(application_pool)
     documents = DocumentRepository(application_pool)
     document_contents = DocumentContentRepository(application_pool)
+    document_files = DocumentFileRepository(application_pool)
+    # 原文件受控存储：与 Checkpoint 共用持久卷目录（容器内 /app/runtime 之下）。
+    upload_storage = ManagedUploadStorage(
+        Path(settings.upload_root), max_bytes=settings.max_document_bytes
+    )
     versions = IndexVersionRepository(application_pool)
     chunks = ChunkRepository(application_pool)
     jobs = IngestionJobRepository(application_pool)
@@ -129,6 +139,8 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
         settings=settings,
         documents=documents,
         contents=document_contents,
+        files=document_files,
+        storage=upload_storage,
         versions=versions,
         chunks=chunks,
         jobs=jobs,
@@ -149,6 +161,8 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
         approvals=approvals,
         documents=documents,
         document_contents=document_contents,
+        document_files=document_files,
+        upload_storage=upload_storage,
         versions=versions,
         chunks=chunks,
         jobs=jobs,

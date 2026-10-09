@@ -185,6 +185,13 @@ class IntentRouter:
 
 
 def request_initialize(state: GraphState) -> dict[str, object]:
+    """初始化本次 Run 的请求级字段。
+
+    `error.repair_attempts` 与 `answer_revision_count` 是跨 Run 保留的执行预算：
+    Resume 的后继 Run 必须沿用 Checkpoint 中已消耗的计数器（GRAPH_CONTRACT Graph-005），
+    因此这里显式沿用传入值，绝不重置为 0。请求级结果字段仍按每次 Run 清空。
+    """
+
     return {
         "intent": None,
         "routing_outcome": None,
@@ -197,8 +204,8 @@ def request_initialize(state: GraphState) -> dict[str, object]:
         "citations": [],
         "answer_candidate": None,
         "answer_validation": None,
-        "answer_revision_count": 0,
-        "error": None,
+        "answer_revision_count": int(state.get("answer_revision_count") or 0),
+        "error": state.get("error"),
         "final_response": None,
     }
 

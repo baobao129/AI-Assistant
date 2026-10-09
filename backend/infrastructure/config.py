@@ -76,14 +76,36 @@ class Settings(BaseSettings):
     mineru_base_url: str = "https://mineru.net/api/v4"
     mineru_api_key: SecretStr = SecretStr("")
     mineru_model_version: Literal["pipeline", "vlm"] = "pipeline"
-    parser_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    # MinerU may need several minutes for a large document; the wait remains bounded.
+    parser_timeout_seconds: float = Field(default=600.0, gt=0, le=600)
 
     # 分块与上下文边界
-    max_document_bytes: int = Field(default=5_242_880, ge=1024)
+    # 本地接受上限（1 GiB，可调）：这是**本地**允许接收的原文件字节上限，
+    # 与远端 provider 的硬限（MINERU_MAX_BYTES / MINERU_MAX_PAGES）是两个独立的数，
+    # 单位都是「字节」，绝不再用 MiB/MB 混写。
+    max_document_bytes: int = Field(default=1_073_741_824, ge=1024, le=8_589_934_592)
+    # 远端 MinerU v4 单份硬限（官方文档：≤200,000,000 字节 **且** ≤200 页，两者都要满足）。
+    # 超过它的非分片文件在本地就明确失败，不把必然被拒的文件送给 provider。
+    mineru_max_bytes: int = Field(default=200_000_000, ge=1024, le=200_000_000)
+    mineru_max_pages: int = Field(default=200, ge=1, le=2000)
+    # 上传前的受控存储余量门控：低于该值时明确拒绝上传（409），而不是写到一半磁盘满。
+    min_storage_free_bytes: int = Field(default=268_435_456, ge=0)
+    # 解析文本的**显式预算**（不是静默截断）：超过即 Job 失败 extracted_text_too_large。
+    # 上限 4,000,000 字符：与 document_contents.extracted_text 的 MEDIUMTEXT（16,777,215 字节）
+    # 对齐——UTF-8 最坏 4 字节/字符时正好 16,000,000 字节，绝不会溢出该列。
+    max_extracted_chars: int = Field(default=4_000_000, ge=10_000, le=4_000_000)
     max_upload_files: int = Field(default=1, ge=1, le=10)
+    # 原文件受控存储根目录：容器内位于持久卷挂载点 /app/runtime 之下，
+    # 宿主直跑时相对工作目录；API 只通过该目录的受控 key 访问，不接受客户端路径。
+    upload_root: Path = Path("runtime/uploads")
+    # 待调度 pending Job：等待超过该秒数仍未领取时由维护任务补调度（有界）。
+    ingestion_pending_schedule_seconds: int = Field(default=15, ge=5, le=600)
+    ingestion_schedule_batch: int = Field(default=10, ge=1, le=50)
     chunk_size_chars: int = Field(default=800, ge=100, le=4000)
     chunk_overlap_chars: int = Field(default=120, ge=0, le=1000)
     parent_chunk_chars: int = Field(default=2400, ge=200, le=20000)
+    # 批处理边界：向量写入按批提交，避免大文档产生单次无界的 Milvus 请求。
+    vector_upsert_batch_size: int = Field(default=256, ge=1, le=2000)
     max_retrieval_top_k: int = Field(default=20, ge=1, le=50)
     default_retrieval_top_k: int = Field(default=5, ge=1, le=50)
     max_context_chars: int = Field(default=6000, ge=500, le=50000)
@@ -118,11 +140,26 @@ class Settings(BaseSettings):
     # Approval / HITL
     approval_expiry_seconds: int = Field(default=1800, ge=60, le=86400)
     export_max_rows: int = Field(default=5000, ge=1, le=50000)
+    # 后继 Run 的陈旧判定：带审批绑定、长时间未推进（updated_at 未变）的 running Run
+    # 视为执行器已崩溃，可被维护任务转回可调度状态；默认 15 分钟，须远大于正常执行时长。
+    run_stale_running_seconds: int = Field(default=900, ge=60, le=86400)
+    # 同一 successor 的最大执行尝试次数（以 agent_start 事件计，含首次执行与每次恢复执行）：
+    # 超过则终止为明确安全失败，避免崩溃恢复进入无限重试。
+    run_max_recovery_attempts: int = Field(default=2, ge=1, le=10)
+    # 执行期续租周期（独立心跳线程，ADR-035）：执行者按该周期刷新 Run 的
+    # heartbeat_at/updated_at，使陈旧判定基于活跃证据而不是领取时刻，且不依赖
+    # Graph 快照或模型输出（单步长阻塞也覆盖）。必须显著小于
+    # RUN_STALE_RUNNING_SECONDS，否则合法长任务会被误判为陈旧并触发第二个执行者。
+    run_heartbeat_seconds: float = Field(default=30.0, gt=0, le=300)
 
     # Ingestion 后台 worker
     ingestion_stale_running_seconds: int = Field(default=1800, ge=60, le=86400)
     ingestion_orphaned_pending_seconds: int = Field(default=300, ge=30, le=86400)
     ingestion_worker_claim_seconds: int = Field(default=120, ge=10, le=3600)
+    # 摄取执行期续租周期（独立心跳线程，ADR-035）：解析/嵌入等单步可能长时间阻塞，
+    # 因此续租必须由后台线程按周期推进，而不是依赖步骤边界。必须显著小于
+    # INGESTION_STALE_RUNNING_SECONDS，否则合法长任务会被误判为陈旧。
+    ingestion_heartbeat_seconds: float = Field(default=30.0, gt=0, le=300)
 
     # SSE
     sse_replay_retention_events: int = Field(default=1000, ge=10, le=10000)

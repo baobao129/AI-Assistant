@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
@@ -24,12 +25,20 @@ from backend.api.schemas import (
     TableListResponse,
     TableResponse,
 )
+from backend.application.ingestion import UploadOutcome
 from backend.domain.auth import AuthenticatedUser
-from backend.domain.errors import not_found, validation_error
+from backend.domain.errors import AppError, conflict, not_found, validation_error
 from backend.domain.identifiers import to_rfc3339
+from backend.infrastructure.file_storage import UploadStorageError
+from backend.infrastructure.parsers import supported_content_type
 from backend.infrastructure.repositories.documents import DocumentRecord
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["data"])
+
+# 上传分块大小：API 逐块读入受控存储，内存占用与文件大小无关。
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def _document_payload(record: DocumentRecord) -> DocumentResponse:
@@ -45,6 +54,51 @@ def _document_payload(record: DocumentRecord) -> DocumentResponse:
     )
 
 
+def _upload_rejection_message(error: UploadStorageError) -> str:
+    code = str(error)
+    if code == "document_too_large":
+        return "The uploaded file exceeds the configured size limit."
+    if code == "storage_unavailable":
+        return "The service cannot accept uploads right now; please retry later."
+    return "The uploaded file could not be stored safely."
+
+
+def _upload_rejection_status(error: UploadStorageError) -> int:
+    """容量不足是服务端状态问题（409 conflict），不是请求内容问题（422）。"""
+
+    return 409 if str(error) == "storage_unavailable" else 422
+
+
+def _upload_error(error: UploadStorageError) -> AppError:
+    message = _upload_rejection_message(error)
+    if _upload_rejection_status(error) == 409:
+        return conflict(message)
+    return validation_error(message)
+
+
+def _schedule_ingestion(container: Container, outcome: UploadOutcome) -> None:
+    """立即调度摄取 Job；容量耗尽**不**报错。
+
+    原文件与 Job 已经持久化（``document_files`` + ``pending`` Job），维护任务每周期用
+    同一个有界 worker 补调度（``MaintenanceWorker.schedule_pending_jobs``），因此不会
+    出现「返回错误但留下无法恢复的 pending」或「文档已创建但客户端拿不到 ID」。
+    """
+
+    if container.ingestion_worker.submit(ingestion_job_id=outcome.ingestion_job_id):
+        return
+    logger.warning("ingestion_schedule_deferred job=%s", outcome.ingestion_job_id[:8])
+
+
+def _upload_payload(outcome: UploadOutcome, *, duplicate: bool) -> DocumentUploadResponse:
+    return DocumentUploadResponse(
+        document_id=outcome.document_id,
+        ingestion_job_id=outcome.ingestion_job_id,
+        index_version=outcome.index_version,
+        status=outcome.status,
+        duplicate=duplicate,
+    )
+
+
 @router.post("/documents", response_model=DocumentUploadResponse, status_code=202)
 async def upload_document(
     file: UploadFile = File(...),
@@ -52,30 +106,62 @@ async def upload_document(
     container: Container = Depends(get_container),
     user: AuthenticatedUser = Depends(get_current_user),
 ) -> DocumentUploadResponse:
-    data = await file.read()
-    if len(data) > container.settings.max_document_bytes:
-        raise validation_error("The uploaded file exceeds the configured size limit.")
-    outcome = container.runtime.ingestion.submit_upload(
-        user_id=user.user_id,
-        filename=file.filename or "document.txt",
-        content_type=file.content_type or "application/octet-stream",
-        data=data,
-        idempotency_key=idempotency_key,
-    )
-    if not outcome.duplicate:
-        scheduled = container.ingestion_worker.submit(
-            ingestion_job_id=outcome.ingestion_job_id, payload=data
+    filename = file.filename or "document.txt"
+    content_type = file.content_type or "application/octet-stream"
+    settings = container.settings
+    # 格式门控先于落盘：不支持的类型不会在受控存储里留下任何字节。
+    if not supported_content_type(
+        content_type, filename, allow_remote_parser=settings.parser_provider == "mineru"
+    ):
+        raise validation_error("This document format is not supported.")
+
+    storage = container.runtime.upload_storage
+    try:
+        # 余量门控先于接收字节：容量不足时明确拒绝（409），不会写到一半磁盘满（ADR-036）。
+        storage.ensure_capacity(min_free_bytes=settings.min_storage_free_bytes)
+    except UploadStorageError as error:
+        raise _upload_error(error) from None
+    writer = storage.begin()
+    try:
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            writer.write(chunk)
+    except UploadStorageError as error:
+        # 超限/写入失败：abort() 只删除暂存件，绝不发布半份文件。
+        writer.abort()
+        raise _upload_error(error) from None
+    except Exception:
+        writer.abort()
+        raise
+    stored = writer.finish()
+    if stored.byte_size == 0:
+        # 空文件永远不会被任何 Document 引用，直接清理。
+        storage.delete(stored.storage_key)
+        raise validation_error("The uploaded file is empty.")
+
+    try:
+        outcome = container.runtime.ingestion.submit_upload(
+            user_id=user.user_id,
+            filename=filename,
+            content_type=content_type,
+            stored=stored,
+            idempotency_key=idempotency_key,
         )
-        if not scheduled:
-            # 容量有界；Job 保持 pending 并如实返回给调用方，绝不隐藏。
-            raise validation_error("Ingestion capacity is temporarily exhausted; retry shortly.")
-    return DocumentUploadResponse(
-        document_id=outcome.document_id,
-        ingestion_job_id=outcome.ingestion_job_id,
-        index_version=outcome.index_version,
-        status=outcome.status,
-        duplicate=outcome.duplicate,
-    )
+    except AppError:
+        # 登记被拒：只有确认当前用户没有引用该内容时才清理文件，
+        # 避免删除重复上传正在使用的原文件（内容寻址会命中同一条目）。
+        existing = container.runtime.documents.find_by_fingerprint(
+            user_id=user.user_id, fingerprint=stored.sha256
+        )
+        if existing is None:
+            storage.delete(stored.storage_key)
+        raise
+
+    if not outcome.duplicate:
+        _schedule_ingestion(container, outcome)
+    return _upload_payload(outcome, duplicate=outcome.duplicate)
 
 
 @router.get("/documents", response_model=DocumentListResponse)
@@ -118,17 +204,8 @@ def delete_document(
     outcome = container.runtime.ingestion.submit_delete(
         user_id=user.user_id, document_id=document_id
     )
-    if not container.ingestion_worker.submit(
-        ingestion_job_id=outcome.ingestion_job_id, payload=None
-    ):
-        raise validation_error("Ingestion capacity is temporarily exhausted; retry shortly.")
-    return DocumentUploadResponse(
-        document_id=outcome.document_id,
-        ingestion_job_id=outcome.ingestion_job_id,
-        index_version=outcome.index_version,
-        status=outcome.status,
-        duplicate=False,
-    )
+    _schedule_ingestion(container, outcome)
+    return _upload_payload(outcome, duplicate=False)
 
 
 @router.post(
@@ -142,17 +219,8 @@ def reindex_document(
     outcome = container.runtime.ingestion.submit_reindex(
         user_id=user.user_id, document_id=document_id
     )
-    if not container.ingestion_worker.submit(
-        ingestion_job_id=outcome.ingestion_job_id, payload=None
-    ):
-        raise validation_error("Ingestion capacity is temporarily exhausted; retry shortly.")
-    return DocumentUploadResponse(
-        document_id=outcome.document_id,
-        ingestion_job_id=outcome.ingestion_job_id,
-        index_version=outcome.index_version,
-        status=outcome.status,
-        duplicate=False,
-    )
+    _schedule_ingestion(container, outcome)
+    return _upload_payload(outcome, duplicate=False)
 
 
 @router.get("/ingestion-jobs/{ingestion_job_id}", response_model=IngestionJobResponse)
@@ -192,17 +260,8 @@ def retry_ingestion_job(
     outcome = container.runtime.ingestion.submit_retry(
         user_id=user.user_id, ingestion_job_id=ingestion_job_id
     )
-    if not container.ingestion_worker.submit(
-        ingestion_job_id=outcome.ingestion_job_id, payload=None
-    ):
-        raise validation_error("Ingestion capacity is temporarily exhausted; retry shortly.")
-    return DocumentUploadResponse(
-        document_id=outcome.document_id,
-        ingestion_job_id=outcome.ingestion_job_id,
-        index_version=outcome.index_version,
-        status=outcome.status,
-        duplicate=False,
-    )
+    _schedule_ingestion(container, outcome)
+    return _upload_payload(outcome, duplicate=False)
 
 
 # Structured Data 检查 API ------------------------------------------------

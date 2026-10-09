@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.application.index_registry import IndexRegistry, IndexRegistryError
 from backend.infrastructure.config import Settings
 from backend.infrastructure.database import DatabaseUnavailableError, ReadOnlyQueryRunner
 from backend.infrastructure.embedding import EmbeddingProvider, EmbeddingProviderError
@@ -21,6 +23,7 @@ from backend.infrastructure.repositories.documents import (
     ChunkRecord,
     ChunkRepository,
     DocumentRepository,
+    IndexVersionRecord,
     IndexVersionRepository,
 )
 from backend.infrastructure.repositories.structured import (
@@ -36,6 +39,8 @@ from backend.tools.contracts import (
     ToolResult,
 )
 from backend.tools.sql_validator import ProjectSQLValidator, SQLValidator
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeSearchInput(BaseModel):
@@ -92,6 +97,7 @@ class KnowledgeSearchTool(RegisteredTool):
         versions: IndexVersionRepository,
         documents: DocumentRepository,
         chunks: ChunkRepository,
+        registry: IndexRegistry,
     ) -> None:
         self.settings = settings
         self.embeddings = embeddings
@@ -99,6 +105,9 @@ class KnowledgeSearchTool(RegisteredTool):
         self.versions = versions
         self.documents = documents
         self.chunks = chunks
+        # 显式 index_version 的生命周期与授权判定复用 application 层的 Index Registry，
+        # 不复制第二套版本授权逻辑。
+        self.registry = registry
 
     def execute(
         self,
@@ -109,7 +118,28 @@ class KnowledgeSearchTool(RegisteredTool):
         started = time.monotonic()
         top_k = min(arguments.top_k, self.settings.max_retrieval_top_k)
         documents = self._authorized_documents(arguments, context)
-        if not documents:
+
+        # 显式版本的生命周期与授权判定先于任何检索执行（也先于任何早期空结果返回）：
+        # active + available + authorized 三者缺一都会被拒绝，绝不通过「先查询再过滤结果」
+        # 实现授权。未找到、非 active、文档不可用与未授权统一映射为同一个安全拒绝码，
+        # 不泄漏其他用户是否拥有该版本。
+        explicit_version = None
+        if arguments.index_version:
+            user_id = context.user_id if context and context.user_id else ""
+            try:
+                resolved_version = self.registry.resolve_explicit_version(
+                    arguments.index_version, user_id=user_id
+                )
+            except IndexRegistryError:
+                return self._rejected(
+                    tool_call_id, "index_version_not_active", "That index version is not active."
+                )
+            explicit_version = self.versions.get(resolved_version)
+            if explicit_version is None:  # pragma: no cover - registry 已解析出该版本
+                return self._rejected(
+                    tool_call_id, "index_version_not_active", "That index version is not active."
+                )
+        elif not documents:
             return self._success(tool_call_id, arguments, [], started, truncated=False)
 
         try:
@@ -119,29 +149,48 @@ class KnowledgeSearchTool(RegisteredTool):
                 tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
             )
         default_collection = self._collection_for(embedding)
+        # 查询向量的 embedding 元信息是兼容性判定的基准：provider/model/dimension 三者
+        # 全部一致的 index version 才允许被该查询向量检索（PROJECT_SPEC §8/§9：模型或维度
+        # 变化会生成新的集合/版本，历史版本仍保留在库中，不能因此让整次检索失败）。
+        query_meta = (self.embeddings.provider_name, self.embeddings.model, len(embedding))
 
-        if arguments.index_version:
-            version = self.versions.get(arguments.index_version)
-            if version is None or version.status != "active":
-                return self._rejected(
-                    tool_call_id, "index_version_not_active", "That index version is not active."
-                )
-            targets = [(version.index_version, version.collection_name or default_collection)]
+        if explicit_version is not None:
+            candidates = [explicit_version]
         else:
             # 每个已授权 Document 都通过自身的 active 版本分别检索，使查询保持有界，
             # 并避免使用一个宽泛的 `document_id IN (...)` 过滤条件。
-            targets = []
+            candidates = []
             for document in documents[: self.MAX_DOCUMENT_SCOPE]:
                 if not document.active_index_version:
                     continue
                 version = self.versions.get(document.active_index_version)
                 if version is None or version.status != "active":
                     continue
-                targets.append(
-                    (version.index_version, version.collection_name or default_collection)
-                )
-            if not targets:
+                candidates.append(version)
+            if not candidates:
                 return self._success(tool_call_id, arguments, [], started, truncated=False)
+
+        # 兼容过滤发生在任何 vector search 之前：不兼容的 index version 直接跳过，
+        # 绝不拿查询向量去搜索元数据不匹配的集合（那会触发向量维度错误并让整次检索失败）。
+        targets: list[tuple[str, str]] = []
+        skipped = 0
+        for version in candidates:
+            if not self._query_compatible(version, query_meta):
+                skipped += 1
+                continue
+            targets.append((version.index_version, version.collection_name or default_collection))
+        if not targets:
+            # 全部候选版本都不兼容：安全失败（由 Graph 归一为 retrieval_unavailable），
+            # 既不检索不匹配的集合，也不允许在缺少授权证据时编造答案。
+            logger.warning("knowledge_search_no_compatible_version skipped=%s", skipped)
+            return self._failed(
+                tool_call_id,
+                "retrieval_unavailable",
+                "Knowledge retrieval is temporarily unavailable.",
+            )
+        if skipped:
+            # 有界日志：只记录被跳过的数量，不记录内容或标识符。
+            logger.info("knowledge_search_skipped_incompatible_versions skipped=%s", skipped)
 
         groups = []
         for index_version, collection in targets:
@@ -191,6 +240,23 @@ class KnowledgeSearchTool(RegisteredTool):
             provider=self.embeddings.provider_name,
             model=self.embeddings.model,
             dimension=len(embedding),
+        )
+
+    def _query_compatible(
+        self, version: IndexVersionRecord, query_meta: tuple[str, str, int]
+    ) -> bool:
+        """查询向量只能检索 embedding 元数据一致的 index version。
+
+        三个条件都必须满足：provider/model 不同的向量空间不可比较（即使维度相同），
+        维度不同则 Milvus 会直接拒绝。判定只使用 ``document_index_versions`` 已登记的
+        字段，不新增架构字段，也不依赖捕获 Milvus 异常。
+        """
+
+        provider, model, dimension = query_meta
+        return (
+            version.embedding_provider == provider
+            and version.embedding_model == model
+            and version.embedding_dimension == dimension
         )
 
     def _search(self, *, collection: str, embedding: list[float], top_k: int, index_version: str):

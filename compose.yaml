@@ -12,7 +12,11 @@ services:
     ports:
       - 127.0.0.1:${MYSQL_HOST_PORT:-13306}:3306
     healthcheck:
-      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --user="$$MYSQL_USER" --database="$$MYSQL_DATABASE" --execute="SELECT 1" >/dev/null 2>&1']
+      test:
+        [
+          CMD-SHELL,
+          'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --user="$$MYSQL_USER" --database="$$MYSQL_DATABASE" --execute="SELECT 1" >/dev/null 2>&1',
+        ]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -67,8 +71,8 @@ services:
     ports:
       - 127.0.0.1:${MILVUS_HOST_PORT:-19530}:19530
     depends_on:
-      etcd: {condition: service_healthy}
-      minio: {condition: service_healthy}
+      etcd: { condition: service_healthy }
+      minio: { condition: service_healthy }
     healthcheck:
       test: [CMD, curl, -f, http://127.0.0.1:9091/healthz]
       interval: 10s
@@ -91,7 +95,9 @@ services:
       MYSQL_READONLY_PASSWORD: ${MYSQL_READONLY_PASSWORD:?Generate .env first}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Generate .env first}
       MILVUS_URI: http://milvus:19530
-      CHECKPOINT_MODE: ${CHECKPOINT_MODE:-memory}
+      # 部署默认持久化档位（ADR-035）：Checkpoint 落在卷内，重启后仍可恢复；
+      # 如需内存档位（不跨重启）在 .env 显式设 CHECKPOINT_MODE=memory
+      CHECKPOINT_MODE: ${CHECKPOINT_MODE:-sqlite}
       CHECKPOINT_SQLITE_PATH: /app/runtime/checkpoints.sqlite
       MAX_TOOL_ITERATIONS: ${MAX_TOOL_ITERATIONS:-8}
       MAX_REPAIR_ATTEMPTS: ${MAX_REPAIR_ATTEMPTS:-3}
@@ -116,6 +122,17 @@ services:
       MINERU_BASE_URL: ${MINERU_BASE_URL:-https://mineru.net/api/v4}
       MINERU_API_KEY: ${MINERU_API_KEY:-}
       MINERU_MODEL_VERSION: ${MINERU_MODEL_VERSION:-pipeline}
+      PARSER_TIMEOUT_SECONDS: ${PARSER_TIMEOUT_SECONDS:-600}
+      # 本地接受上限（默认 1 GiB）与远端 MinerU 单份硬限（200,000,000 字节且 200 页）是两个独立的数
+      MAX_DOCUMENT_BYTES: ${MAX_DOCUMENT_BYTES:-1073741824}
+      MINERU_MAX_BYTES: ${MINERU_MAX_BYTES:-200000000}
+      MINERU_MAX_PAGES: ${MINERU_MAX_PAGES:-200}
+      MIN_STORAGE_FREE_BYTES: ${MIN_STORAGE_FREE_BYTES:-268435456}
+      MAX_EXTRACTED_CHARS: ${MAX_EXTRACTED_CHARS:-4000000}
+      # LangSmith 追踪：默认关闭，避免企业数据外发；如需开启在 .env 设 LANGSMITH_TRACING=true
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
       SQL_MAX_ROWS: ${SQL_MAX_ROWS:-100}
       SQL_QUERY_TIMEOUT_SECONDS: ${SQL_QUERY_TIMEOUT_SECONDS:-10}
       DATA_SOURCE_ID: ${DATA_SOURCE_ID:-demo_sales}
@@ -125,16 +142,32 @@ services:
       AUTH_BOOTSTRAP_USERNAME: ${AUTH_BOOTSTRAP_USERNAME:-demo}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:?Generate .env first}
       APPROVAL_EXPIRY_SECONDS: ${APPROVAL_EXPIRY_SECONDS:-1800}
+      # Run 执行租约与有界崩溃恢复（见 .env.example 与 docs/OPERATIONS_RUNBOOK.md）
+      RUN_STALE_RUNNING_SECONDS: ${RUN_STALE_RUNNING_SECONDS:-900}
+      RUN_MAX_RECOVERY_ATTEMPTS: ${RUN_MAX_RECOVERY_ATTEMPTS:-2}
+      RUN_HEARTBEAT_SECONDS: ${RUN_HEARTBEAT_SECONDS:-30}
+      # 原文件受控存储与 pending 摄取 Job 补调度（默认位于持久卷 /app/runtime 之下）
+      UPLOAD_ROOT: ${UPLOAD_ROOT:-runtime/uploads}
+      INGESTION_PENDING_SCHEDULE_SECONDS: ${INGESTION_PENDING_SCHEDULE_SECONDS:-15}
+      INGESTION_SCHEDULE_BATCH: ${INGESTION_SCHEDULE_BATCH:-10}
+      # 摄取执行期独立心跳（执行租约续租）周期秒数（ADR-035）
+      INGESTION_HEARTBEAT_SECONDS: ${INGESTION_HEARTBEAT_SECONDS:-30}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - checkpoint_data:/app/runtime
     ports:
       - 127.0.0.1:${BACKEND_PORT:-8000}:8000
     depends_on:
-      mysql: {condition: service_healthy}
-      milvus: {condition: service_healthy}
+      mysql: { condition: service_healthy }
+      milvus: { condition: service_healthy }
     healthcheck:
-      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10)"]
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=10)",
+        ]
       interval: 15s
       timeout: 12s
       retries: 6
@@ -147,7 +180,7 @@ services:
     ports:
       - 127.0.0.1:${FRONTEND_PORT:-5173}:8080
     depends_on:
-      backend: {condition: service_healthy}
+      backend: { condition: service_healthy }
     healthcheck:
       test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/]
       interval: 15s

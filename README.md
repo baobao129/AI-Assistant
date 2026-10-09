@@ -110,6 +110,12 @@ Set `LLM_API_KEY` to enable requests. Local execution is opt-in with `LLM_PROVID
 does not declare `tool_calling` is rejected at the Structured Data Graph boundary. The
 Structured Data Agent model is selected by `SQL_AGENT_PROVIDER` (`auto`, `llm`, `scripted`).
 
+LangSmith tracing is optional and off by default; no LangSmith configuration is required to
+start or verify the project. To opt in, set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY`
+in `.env` (see `.env.example`). When enabled, graph execution traces — including prompts,
+retrieval context, and SQL results — are sent to the LangSmith cloud, so confirm compliance
+before enabling it on sensitive data.
+
 ## API surface
 
 `/api/v1` provides authentication, Conversation/Message reads, Run creation and status,
@@ -120,7 +126,11 @@ filesystem, URL, Graph State, or Checkpoint endpoint.
 
 ## Known limitations
 
-- MinerU is not deployed here; the lightweight Parser handles text, Markdown, CSV, and JSON.
+- MinerU v4 cloud parsing is wired as an opt-in parser profile (`PARSER_PROVIDER=mineru`,
+  see `.env.example` and `docs/OPERATIONS_RUNBOOK.md` for the profile and quota notes);
+  the lightweight parser remains the default and handles text, Markdown, CSV, and JSON.
+  Large-file sharding and the full format matrix (xls/xlsx, real page numbers) are V1 work
+  tracked in `docs/POST_MVP_PROGRESS.md`.
 - MVP mixed Knowledge/Structured Data requests are reported as unsupported.
 - `token` is a contract-reserved SSE event type: it stays registered in the Event
   Contract, but the current LLM profiles generate the answer in one complete step and do

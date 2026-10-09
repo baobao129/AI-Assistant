@@ -1,8 +1,12 @@
-"""Parser Adapter 边界（ADR-007）与 Parent/Child 分块。
+"""Parser Adapter 边界（ADR-007 / ADR-036）与 Parent/Child 分块。
 
 ``MinerUParser`` 对接 mineru.net v4 云解析 API（异步任务：预签名上传 → 轮询结果 →
-下载 ZIP 取 full.md）；``LightweightParser`` 作为开发兜底解析纯文本、Markdown、CSV
-与 JSON。parser 返回规范化文本与安全元数据，且绝不触碰 Graph State。
+下载 ZIP 取 full.md）；``LightweightParser`` 解析纯文本、Markdown、CSV 与 JSON；
+``RoutedParser`` 按文件类型路由：文本类始终走本地解析（MinerU 档位下同样如此），
+其余类型走远端 provider。parser 返回规范化文本与安全元数据，且绝不触碰 Graph State。
+
+文本长度是**显式预算**而不是静默截断（ADR-036 决策 2）：超出预算时抛
+``extracted_text_too_large``，由摄取层明确失败，绝不索引一个前缀冒充全文。
 """
 
 from __future__ import annotations
@@ -31,7 +35,10 @@ TEXT_CONTENT_TYPES: frozenset[str] = frozenset(
 )
 SUPPORTED_SUFFIXES: tuple[str, ...] = (".txt", ".md", ".markdown", ".csv", ".json")
 
-# MinerU 精准解析 API 支持的上传类型（≤200MB、≤600 页，官方文档 v4）。
+# MinerU 精准解析 API 支持的上传类型（官方文档 v4：单份 ≤200,000,000 字节且 ≤200 页）。
+# 注意：官方不支持 .md/.txt/.csv/.json 等文本类，因此这些类型由本地 parser 处理；
+# .xls/.xlsx 的 provider 能力尚未核验（P2 剩余工作），在核验前不接受，绝不只改扩展名
+# allowlist（ADR-036 决策 8）。
 MINERU_SUFFIXES: tuple[str, ...] = (
     ".pdf",
     ".doc",
@@ -51,6 +58,13 @@ MINERU_SUFFIXES: tuple[str, ...] = (
 
 # 轮询间隔与终态：整体等待仍受 parser_timeout_seconds 约束，绝不无限轮询。
 MINERU_POLL_INTERVAL_SECONDS = 5.0
+
+# 结果归档的强制边界（ADR-036 决策 6）：下载字节、条目数、解压总量与单个 Markdown
+# 条目都有界，路径一律校验，绝不写磁盘。
+MAX_ARCHIVE_BYTES = 400_000_000
+MAX_ZIP_ENTRIES = 1000
+MAX_ZIP_UNCOMPRESSED_BYTES = 400_000_000
+MAX_MARKDOWN_ENTRY_BYTES = 64_000_000
 
 
 class ParserError(RuntimeError):
@@ -80,17 +94,33 @@ class ParsedDocument:
 class DocumentParser(Protocol):
     provider_name: str
 
+    def provider_for(self, *, filename: str, content_type: str) -> str: ...
+
     def parse(self, *, filename: str, content_type: str, data: bytes) -> ParsedDocument: ...
 
 
+def is_text_document(content_type: str, filename: str) -> bool:
+    """文本类文档（本地 parser 可完整处理，永不需要远端 provider）。"""
+
+    lowered = filename.casefold()
+    return (
+        content_type in TEXT_CONTENT_TYPES
+        or content_type.startswith("text/")
+        or lowered.endswith(SUPPORTED_SUFFIXES)
+    )
+
+
 class LightweightParser:
-    """开发用兜底 parser：纯文本、Markdown、CSV 与 JSON。"""
+    """本地 parser：纯文本、Markdown、CSV 与 JSON（有界、无静默截断）。"""
 
     provider_name = "lightweight"
 
-    def __init__(self, *, max_bytes: int, max_chars: int = 400_000) -> None:
+    def __init__(self, *, max_bytes: int, max_chars: int = 4_000_000) -> None:
         self.max_bytes = max_bytes
         self.max_chars = max_chars
+
+    def provider_for(self, *, filename: str, content_type: str) -> str:
+        return self.provider_name
 
     def parse(self, *, filename: str, content_type: str, data: bytes) -> ParsedDocument:
         if not data:
@@ -101,14 +131,15 @@ class LightweightParser:
         normalized = normalize_text(text)
         if not normalized.strip():
             raise ParserError("no_extractable_text")
-        truncated = len(normalized) > self.max_chars
+        if len(normalized) > self.max_chars:
+            # 显式预算：超出即失败，绝不索引前缀冒充全文（ADR-036 决策 2）。
+            raise ParserError("extracted_text_too_large")
         return ParsedDocument(
-            text=normalized[: self.max_chars],
+            text=normalized,
             title=filename,
             parser=self.provider_name,
             pages=1,
-            truncated=truncated,
-            warnings=("text_truncated",) if truncated else (),
+            truncated=False,
         )
 
     @staticmethod
@@ -134,6 +165,9 @@ class MinerUParser:
     地址，上传时**不得携带 Authorization**（否则双重鉴权会被 403 拒绝）；随后有界轮询
     ``GET {base}/extract-results/batch/{batch_id}``，完成后从 ``full_zip_url`` 下载 ZIP
     并取其中的 ``full.md``。整个等待受 ``timeout_seconds`` 约束，绝不无限轮询。
+
+    ``max_bytes`` 必须是**远端单份硬限**（``MINERU_MAX_BYTES``），而不是本地接受上限：
+    必然被 provider 拒绝的文件在本地就明确失败（ADR-036 决策 1）。
     """
 
     provider_name = "mineru"
@@ -147,6 +181,10 @@ class MinerUParser:
         timeout_seconds: float,
         max_bytes: int,
         poll_interval_seconds: float = MINERU_POLL_INTERVAL_SECONDS,
+        max_archive_bytes: int = MAX_ARCHIVE_BYTES,
+        max_zip_entries: int = MAX_ZIP_ENTRIES,
+        max_zip_uncompressed_bytes: int = MAX_ZIP_UNCOMPRESSED_BYTES,
+        max_markdown_entry_bytes: int = MAX_MARKDOWN_ENTRY_BYTES,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -154,12 +192,19 @@ class MinerUParser:
         self.timeout_seconds = timeout_seconds
         self.max_bytes = max_bytes
         self.poll_interval_seconds = poll_interval_seconds
+        self.max_archive_bytes = max_archive_bytes
+        self.max_zip_entries = max_zip_entries
+        self.max_zip_uncompressed_bytes = max_zip_uncompressed_bytes
+        self.max_markdown_entry_bytes = max_markdown_entry_bytes
+
+    def provider_for(self, *, filename: str, content_type: str) -> str:
+        return self.provider_name
 
     def parse(self, *, filename: str, content_type: str, data: bytes) -> ParsedDocument:
         if not data:
             raise ParserError("empty_document")
         if len(data) > self.max_bytes:
-            raise ParserError("document_too_large")
+            raise ParserError("document_exceeds_parser_limit")
         if not self.api_key:
             # 云 API 必须携带 Token；缺失时安全失败，绝不尝试匿名上传。
             raise ParserError("parser_unavailable")
@@ -237,49 +282,144 @@ class MinerUParser:
             time.sleep(min(self.poll_interval_seconds, remaining))
 
     def _download_markdown(self, zip_url: str, deadline: float) -> str:
+        """有界下载结果归档并读取 Markdown 条目（绝不写磁盘、绝不信任归档内路径）。"""
+
+        if not _is_allowed_result_url(zip_url):
+            raise ParserError("parser_result_unsafe")
         remaining = max(1.0, min(self.timeout_seconds, deadline - time.monotonic()))
         try:
-            response = httpx.get(zip_url, timeout=remaining)
-            response.raise_for_status()
-            archive = zipfile.ZipFile(io.BytesIO(response.content))
-        except (httpx.HTTPError, zipfile.BadZipFile, OSError) as error:
+            with httpx.stream("GET", zip_url, timeout=remaining, follow_redirects=True) as response:
+                response.raise_for_status()
+                declared = response.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > self.max_archive_bytes:
+                    raise ParserError("parser_result_too_large")
+                payload = bytearray()
+                for chunk in response.iter_bytes():
+                    payload.extend(chunk)
+                    if len(payload) > self.max_archive_bytes:
+                        # 声明长度不可信：边读边限，绝不把无界内容读进内存。
+                        raise ParserError("parser_result_too_large")
+        except ParserError:
+            raise
+        except (httpx.HTTPError, OSError) as error:
             raise ParserError("parser_unavailable") from error
-        names = [name for name in archive.namelist() if name.casefold().endswith("full.md")]
-        if not names:
-            names = [name for name in archive.namelist() if name.casefold().endswith(".md")]
-        if not names:
-            raise ParserError("no_extractable_text")
+        return self._read_markdown_from_archive(bytes(payload))
+
+    def _read_markdown_from_archive(self, payload: bytes) -> str:
+        """解压前校验条目数/解压总量/路径，读取时再按上限有界截断读取。"""
+
         try:
-            return archive.read(names[0]).decode("utf-8", errors="replace")
-        except (KeyError, OSError) as error:
-            raise ParserError("no_extractable_text") from error
+            archive = zipfile.ZipFile(io.BytesIO(payload))
+        except (zipfile.BadZipFile, OSError) as error:
+            raise ParserError("parser_unavailable") from error
+        with archive:
+            infos = archive.infolist()
+            if len(infos) > self.max_zip_entries:
+                raise ParserError("parser_result_too_large")
+            total_uncompressed = 0
+            candidates: list[zipfile.ZipInfo] = []
+            for info in infos:
+                if not _is_safe_archive_name(info.filename):
+                    # 目录越界或可疑路径：整个结果视为不可信，明确失败。
+                    raise ParserError("parser_result_unsafe")
+                total_uncompressed += max(0, int(info.file_size))
+                if total_uncompressed > self.max_zip_uncompressed_bytes:
+                    raise ParserError("parser_result_too_large")
+                lowered = info.filename.casefold()
+                if not info.is_dir() and lowered.endswith(".md"):
+                    candidates.append(info)
+            if not candidates:
+                raise ParserError("no_extractable_text")
+            # 优先使用 provider 的合并结果 full.md，否则取第一个 Markdown 条目。
+            candidates.sort(key=lambda info: (not info.filename.casefold().endswith("full.md"),))
+            chosen = candidates[0]
+            if self.max_markdown_entry_bytes and chosen.file_size > self.max_markdown_entry_bytes:
+                raise ParserError("parser_result_too_large")
+            try:
+                with archive.open(chosen) as handle:
+                    raw = handle.read(self.max_markdown_entry_bytes + 1)
+            except (KeyError, OSError, zipfile.BadZipFile) as error:
+                raise ParserError("no_extractable_text") from error
+            if len(raw) > self.max_markdown_entry_bytes:
+                raise ParserError("parser_result_too_large")
+        return raw.decode("utf-8", errors="replace")
+
+
+def _is_safe_archive_name(name: str) -> bool:
+    """归档条目名必须相对、无越界（绝不写磁盘，但仍拒绝可疑路径）。"""
+
+    if not name or name.startswith(("/", "\\")):
+        return False
+    if "\\" in name or ":" in name:
+        return False
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    return all(part != ".." for part in parts)
+
+
+def _is_allowed_result_url(url: str) -> bool:
+    """结果下载地址必须来自 provider 响应里的 http(s) 地址（拒绝其它 scheme）。"""
+
+    return url.startswith("https://") or url.startswith("http://")
+
+
+class RoutedParser:
+    """按文件类型路由的 parser（ADR-036 决策 5）。
+
+    文本类文件（``text/*``、``.txt/.md/.markdown/.csv/.json``）永远走本地 parser：
+    MinerU v4 云 API 不支持这些类型（实测返回 ``unsupported file type``），此前在
+    ``PARSER_PROVIDER=mineru`` 档位下上传 Markdown 必然失败。其余类型走远端 provider。
+    ``provider_for`` 报告**真正解析该文件**的 provider，版本元数据据此记录。
+    """
+
+    provider_name = "routed"
+
+    def __init__(self, *, local: LightweightParser, remote: MinerUParser) -> None:
+        self.local = local
+        self.remote = remote
+
+    def provider_for(self, *, filename: str, content_type: str) -> str:
+        return self.parser_for(filename=filename, content_type=content_type).provider_name
+
+    def parser_for(self, *, filename: str, content_type: str) -> DocumentParser:
+        if is_text_document(content_type, filename):
+            return self.local
+        return self.remote
+
+    def parse(self, *, filename: str, content_type: str, data: bytes) -> ParsedDocument:
+        return self.parser_for(filename=filename, content_type=content_type).parse(
+            filename=filename, content_type=content_type, data=data
+        )
 
 
 def create_parser(settings: Settings) -> DocumentParser:
-    if settings.parser_provider == "mineru":
-        return MinerUParser(
-            base_url=settings.mineru_base_url,
-            api_key=settings.mineru_api_key.get_secret_value(),
-            model_version=settings.mineru_model_version,
-            timeout_seconds=settings.parser_timeout_seconds,
-            max_bytes=settings.max_document_bytes,
-        )
-    return LightweightParser(max_bytes=settings.max_document_bytes)
+    """按配置装配 parser；MinerU 档位下文本类仍由本地 parser 处理（ADR-036 决策 5）。"""
+
+    local = LightweightParser(
+        max_bytes=settings.max_document_bytes, max_chars=settings.max_extracted_chars
+    )
+    if settings.parser_provider != "mineru":
+        return local
+    remote = MinerUParser(
+        base_url=settings.mineru_base_url,
+        api_key=settings.mineru_api_key.get_secret_value(),
+        model_version=settings.mineru_model_version,
+        timeout_seconds=settings.parser_timeout_seconds,
+        # 远端单份硬限（不是本地接受上限）：必然被 provider 拒绝的文件在本地就失败。
+        max_bytes=settings.mineru_max_bytes,
+    )
+    return RoutedParser(local=local, remote=remote)
 
 
 def supported_content_type(
     content_type: str, filename: str, *, allow_remote_parser: bool = False
 ) -> bool:
-    """上传类型门控：轻量解析器支持文本类；启用 MinerU 时额外接受其文档/图片类型。"""
+    """上传类型门控：文本类始终支持；远端类型仅当该档位真的能解析时才接受。"""
 
-    lowered = filename.casefold()
-    if allow_remote_parser and lowered.endswith(MINERU_SUFFIXES):
+    if is_text_document(content_type, filename):
         return True
-    return (
-        content_type in TEXT_CONTENT_TYPES
-        or content_type.startswith("text/")
-        or lowered.endswith(SUPPORTED_SUFFIXES)
-    )
+    if allow_remote_parser and filename.casefold().endswith(MINERU_SUFFIXES):
+        return True
+    return False
 
 
 @dataclass(frozen=True)

@@ -126,12 +126,30 @@ class ApprovalRepository:
         本次调用完成了转换时返回 ``True``；重复决策返回 ``False``，且绝不产生第二次副作用。
         """
 
-        affected = self.pool.execute(
-            "UPDATE approvals SET status = %s, decided_at = %s, decided_by = %s, "
-            "successor_run_id = %s WHERE approval_request_id = %s AND status = 'pending'",
-            (lifecycle, utc_now(), decided_by, successor_run_id, approval_request_id),
+        with self.pool.cursor() as cursor:
+            return decide_with_cursor(
+                cursor,
+                approval_request_id,
+                lifecycle=lifecycle,
+                decided_by=decided_by,
+                successor_run_id=successor_run_id,
+            )
+
+    def list_pending_successor_run_ids(self, *, limit: int = 20) -> list[tuple[str, str]]:
+        """已批准但其 successor Run 从未被领取执行的 ``(run_id, approval_request_id)``。
+
+        这是崩溃或调度容量耗尽后的**持久化调度意图**：只要该行存在，恢复任务
+        （或任何幂等重试）都能重新调度它，而不会创建第二个 successor。
+        """
+
+        rows = self.pool.query(
+            "SELECT r.run_id, a.approval_request_id FROM approvals a "
+            "JOIN runs r ON r.run_id = a.successor_run_id "
+            "WHERE a.status = 'approved' AND r.status = 'accepted' "
+            "ORDER BY a.decided_at LIMIT %s",
+            (limit,),
         )
-        return affected > 0
+        return [(str(row[0]), str(row[1])) for row in rows]
 
     def mark_expired(self, approval_request_id: str) -> bool:
         affected = self.pool.execute(
@@ -141,18 +159,38 @@ class ApprovalRepository:
         )
         return affected > 0
 
-    def expire_due(self, *, limit: int = 100) -> list[str]:
+    def list_due_pending(self, *, limit: int = 100) -> list[ApprovalRecord]:
+        """已到期但仍待决策的审批请求（过期转换的候选集合，供维护任务有界处理）。
+
+        只按 ``expires_at`` 与 ``pending`` 生命周期筛选；到期的审批在转换前始终留在
+        该集合里，因此任何中断都能被下一次维护周期重新拾起，不会因为「已改为 expired」
+        而漏掉尚未终结的 Run。
+        """
+
         rows = self.pool.query(
-            "SELECT approval_request_id FROM approvals "
+            f"SELECT {APPROVAL_COLUMNS} FROM approvals "
             "WHERE status = 'pending' AND expires_at <= %s "
             "ORDER BY expires_at ASC LIMIT %s",
             (utc_now(), limit),
         )
-        expired: list[str] = []
-        for row in rows:
-            if self.mark_expired(str(row[0])):
-                expired.append(str(row[0]))
-        return expired
+        return [record for row in rows if (record := _approval(row)) is not None]
+
+    def list_expired_unterminated(self, *, limit: int = 20) -> list[str]:
+        """已过期、但其原 Run 仍停在 ``awaiting_approval`` 的审批（缺口修复候选）。
+
+        这类行只会由「先提交审批 expired、再更新 Run」的非原子路径留下（历史版本或
+        异常中断）。它们已不是 ``pending``，因此不会进入常规过期集合；本查询让维护任务
+        仍能把对应 Run 补齐为终态，避免残留永久存在。
+        """
+
+        rows = self.pool.query(
+            "SELECT a.approval_request_id FROM approvals a "
+            "JOIN runs r ON r.run_id = a.run_id "
+            "WHERE a.status = 'expired' AND r.status = 'awaiting_approval' "
+            "ORDER BY a.decided_at LIMIT %s",
+            (limit,),
+        )
+        return [str(row[0]) for row in rows]
 
     def record_artifact(self, approval_request_id: str, *, artifact_id: str) -> bool:
         affected = self.pool.execute(
@@ -161,6 +199,41 @@ class ApprovalRepository:
             (artifact_id, utc_now(), approval_request_id),
         )
         return affected > 0
+
+
+def decide_with_cursor(
+    cursor,
+    approval_request_id: str,
+    *,
+    lifecycle: Literal["approved", "rejected"],
+    decided_by: str,
+    successor_run_id: str | None = None,
+) -> bool:
+    """在调用方的事务内执行 ``pending`` 到终态决策的条件更新（幂等 CAS）。
+
+    CAS 同时校验 ``expires_at > NOW``：过期判定以数据库时间为权威，应用层的
+    ``is_expired()`` 预检查与本次更新之间即便发生时间竞态，过期审批也绝不会被批准。
+    """
+
+    now = utc_now()
+    affected = cursor.execute(
+        "UPDATE approvals SET status = %s, decided_at = %s, decided_by = %s, "
+        "successor_run_id = %s WHERE approval_request_id = %s AND status = 'pending' "
+        "AND expires_at > %s",
+        (lifecycle, now, decided_by, successor_run_id, approval_request_id, now),
+    )
+    return int(affected) > 0
+
+
+def expire_with_cursor(cursor, approval_request_id: str) -> bool:
+    """在调用方的事务内把待决策审批条件转换为 ``expired``（幂等 CAS）。"""
+
+    affected = cursor.execute(
+        "UPDATE approvals SET status = 'expired', decided_at = %s "
+        "WHERE approval_request_id = %s AND status = 'pending'",
+        (utc_now(), approval_request_id),
+    )
+    return int(affected) > 0
 
 
 def _approval(row: tuple[Any, ...] | None) -> ApprovalRecord | None:

@@ -35,6 +35,9 @@ JOB_COLUMNS = (
     "ingestion_job_id, document_id, index_version, job_type, status, attempt, failure_code, "
     "failure_message, claimed_at, created_at, updated_at, finished_at"
 )
+DOCUMENT_FILE_COLUMNS = (
+    "document_id, storage_key, sha256, byte_size, content_type, source_name, created_at, updated_at"
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,20 @@ class IngestionJobRecord:
     created_at: datetime
     updated_at: datetime
     finished_at: datetime | None
+
+
+@dataclass(frozen=True)
+class DocumentFileRecord:
+    """原文件引用：受控 storage_key + 内容特性（不含用户路径）。"""
+
+    document_id: str
+    storage_key: str
+    sha256: str
+    byte_size: int
+    content_type: str
+    source_name: str
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -372,13 +389,50 @@ class IngestionJobRepository:
         )
         return [record for row in rows if (record := _job(row)) is not None]
 
-    def claim(self, ingestion_job_id: str) -> bool:
+    def claim(self, ingestion_job_id: str, *, owner_token: str) -> bool:
+        """把 ``pending`` Job 原子地转换为 ``running`` 并记录执行所有权。
+
+        领取是唯一设置 owner 的入口（``pending`` 唯一可领取），因此一个 Job 最多被
+        一个 worker 执行；``owner_token`` 供其后所有提交点做所有权校验（ADR-035）。
+        """
+
+        now = utc_now()
         affected = self.pool.execute(
-            "UPDATE ingestion_jobs SET status = %s, claimed_at = %s, updated_at = %s "
+            "UPDATE ingestion_jobs SET status = %s, owner_token = %s, claimed_at = %s, "
+            "heartbeat_at = %s, updated_at = %s "
             "WHERE ingestion_job_id = %s AND status = %s",
-            (JOB_STATUS_RUNNING, utc_now(), utc_now(), ingestion_job_id, JOB_STATUS_PENDING),
+            (
+                JOB_STATUS_RUNNING,
+                owner_token[:64],
+                now,
+                now,
+                now,
+                ingestion_job_id,
+                JOB_STATUS_PENDING,
+            ),
         )
         return affected > 0
+
+    def heartbeat(self, ingestion_job_id: str, *, owner_token: str) -> bool:
+        """独立心跳续租：仅当 Job 仍是 ``running`` 且仍由该 token 持有时推进租约。"""
+
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE ingestion_jobs SET heartbeat_at = %s, updated_at = %s "
+            "WHERE ingestion_job_id = %s AND status = %s AND owner_token = %s",
+            (now, now, ingestion_job_id, JOB_STATUS_RUNNING, owner_token),
+        )
+        return affected > 0
+
+    def still_owned(self, ingestion_job_id: str, *, owner_token: str) -> bool:
+        """该 Job 是否仍处于 ``running`` 且仍归属于该 token（promote/清理提交点校验）。"""
+
+        row = self.pool.query_one(
+            "SELECT 1 FROM ingestion_jobs "
+            "WHERE ingestion_job_id = %s AND status = %s AND owner_token = %s",
+            (ingestion_job_id, JOB_STATUS_RUNNING, owner_token),
+        )
+        return row is not None
 
     def finish(
         self,
@@ -387,20 +441,35 @@ class IngestionJobRepository:
         status: str,
         failure_code: str | None = None,
         failure_message: str | None = None,
-    ) -> None:
+        owner_token: str | None = None,
+    ) -> bool:
+        """写入 Job 终态；执行者路径必须给出 ``owner_token``（提交点所有权校验）。
+
+        给出 token 时是条件更新（``status = running AND owner_token = ?``）：已被陈旧
+        恢复撤销所有权的旧 worker 无法再写终态。``owner_token=None`` 仅供管理/测试
+        的显式终结使用（例如强制制造一次失败）。终态行一律清空 owner。
+        """
+
         now = utc_now()
-        self.pool.execute(
+        parameters: list[Any] = [
+            status,
+            failure_code[:64] if failure_code else None,
+            failure_message[:500] if failure_message else None,
+            now,
+            now,
+            ingestion_job_id,
+        ]
+        clause = ""
+        if owner_token is not None:
+            clause = " AND status = %s AND owner_token = %s"
+            parameters.extend([JOB_STATUS_RUNNING, owner_token])
+        affected = self.pool.execute(
             "UPDATE ingestion_jobs SET status = %s, failure_code = %s, failure_message = %s, "
-            "updated_at = %s, finished_at = %s WHERE ingestion_job_id = %s",
-            (
-                status,
-                failure_code[:64] if failure_code else None,
-                failure_message[:500] if failure_message else None,
-                now,
-                now,
-                ingestion_job_id,
-            ),
+            "owner_token = NULL, updated_at = %s, finished_at = %s "
+            f"WHERE ingestion_job_id = %s{clause}",
+            parameters,
         )
+        return affected > 0
 
     def max_attempt(self, document_id: str) -> int:
         row = self.pool.query_one(
@@ -410,12 +479,44 @@ class IngestionJobRepository:
 
     # 启动恢复 ------------------------------------------------------
     def fail_stale_running(self, *, older_than: datetime) -> int:
-        return self.pool.execute(
-            "UPDATE ingestion_jobs SET status = %s, failure_code = 'stale_running_job', "
-            "failure_message = 'Job did not finish before startup recovery.', updated_at = %s, "
-            "finished_at = %s WHERE status = %s AND updated_at < %s",
-            (JOB_STATUS_FAILED, utc_now(), utc_now(), JOB_STATUS_RUNNING, older_than),
-        )
+        """把租约已陈旧的 ``running`` Job 终结为 ``failed`` 并撤销其执行所有权。
+
+        陈旧判定基于 ``COALESCE(heartbeat_at, updated_at)``：由独立心跳线程续租的
+        ``heartbeat_at`` 是租约权威时间戳（单步长阻塞也不影响），未迁移的旧行退回
+        ``updated_at``。撤销所有权（``owner_token = NULL``）与对应的索引版本一同失败，
+        使旧 worker 的 finish/promote 变成无副作用的条件更新失败（ADR-035）。
+        """
+
+        now = utc_now()
+        with self.pool.transaction() as cursor:
+            cursor.execute(
+                "SELECT ingestion_job_id, index_version FROM ingestion_jobs "
+                "WHERE status = %s AND COALESCE(heartbeat_at, updated_at) < %s",
+                (JOB_STATUS_RUNNING, older_than),
+            )
+            rows = list(cursor.fetchall())
+            if not rows:
+                return 0
+            job_ids = [str(row[0]) for row in rows]
+            versions = [str(row[1]) for row in rows]
+            job_placeholders = ", ".join(["%s"] * len(job_ids))
+            cursor.execute(
+                "UPDATE ingestion_jobs SET status = %s, owner_token = NULL, "
+                "failure_code = 'stale_running_job', "
+                "failure_message = 'Job did not finish before startup recovery.', "
+                f"updated_at = %s, finished_at = %s WHERE ingestion_job_id IN ({job_placeholders})",
+                (JOB_STATUS_FAILED, now, now, *job_ids),
+            )
+            version_placeholders = ", ".join(["%s"] * len(versions))
+            # 从未 promote 过的版本随 Job 一起失败；已 active 的版本不受影响。
+            cursor.execute(
+                "UPDATE document_index_versions SET status = %s, "
+                "failure_code = 'stale_running_job', "
+                f"updated_at = %s WHERE index_version IN ({version_placeholders}) "
+                "AND status <> 'active'",
+                (INDEX_STATUS_FAILED, now, *versions),
+            )
+        return len(job_ids)
 
     def fail_orphaned_pending(self, *, older_than: datetime) -> int:
         return self.pool.execute(
@@ -424,6 +525,108 @@ class IngestionJobRepository:
             "finished_at = %s WHERE status = %s AND claimed_at IS NULL AND created_at < %s",
             (JOB_STATUS_FAILED, utc_now(), utc_now(), JOB_STATUS_PENDING, older_than),
         )
+
+    def list_pending(self, *, older_than: datetime, limit: int) -> list[str]:
+        """等待超过阈值仍未领取的 pending Job（维护任务的补调度候选，有界）。
+
+        只挑「从未被领取」的行（``claimed_at IS NULL``）：已被 worker 领取的任务由其
+        自身完成或由陈旧恢复处理，补调度不会重复执行。
+        """
+
+        rows = self.pool.query(
+            "SELECT ingestion_job_id FROM ingestion_jobs "
+            "WHERE status = %s AND claimed_at IS NULL AND created_at < %s "
+            "ORDER BY created_at ASC LIMIT %s",
+            (JOB_STATUS_PENDING, older_than, limit),
+        )
+        return [str(row[0]) for row in rows]
+
+
+class DocumentFileRepository:
+    """受控存储中的原文件引用（CR-RUNTIME-20261009-01）。
+
+    只保存受控 ``storage_key``（内容寻址），绝不保存用户提供的路径；解析、重试与
+    后续分片都从这里取原始字节，因此重启后 Job 仍然可执行。
+    """
+
+    def __init__(self, pool: MySQLConnectionPool) -> None:
+        self.pool = pool
+
+    def upsert(
+        self,
+        *,
+        document_id: str,
+        storage_key: str,
+        sha256: str,
+        byte_size: int,
+        content_type: str,
+        source_name: str,
+    ) -> DocumentFileRecord:
+        now = utc_now()
+        self.pool.execute(
+            "INSERT INTO document_files (document_id, storage_key, sha256, byte_size, "
+            "content_type, source_name, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE storage_key = VALUES(storage_key), sha256 = VALUES(sha256), "
+            "byte_size = VALUES(byte_size), content_type = VALUES(content_type), "
+            "source_name = VALUES(source_name), updated_at = VALUES(updated_at)",
+            (
+                document_id,
+                storage_key[:512],
+                sha256,
+                byte_size,
+                content_type[:100],
+                source_name[:300],
+                now,
+                now,
+            ),
+        )
+        return DocumentFileRecord(
+            document_id=document_id,
+            storage_key=storage_key,
+            sha256=sha256,
+            byte_size=byte_size,
+            content_type=content_type[:100],
+            source_name=source_name[:300],
+            created_at=now,
+            updated_at=now,
+        )
+
+    def get(self, document_id: str) -> DocumentFileRecord | None:
+        row = self.pool.query_one(
+            f"SELECT {DOCUMENT_FILE_COLUMNS} FROM document_files WHERE document_id = %s",
+            (document_id,),
+        )
+        return _document_file(row)
+
+    def count_by_storage_key(self, storage_key: str) -> int:
+        """统计仍引用同一受控对象的行数（内容寻址下删除前必须先确认无其它引用）。"""
+
+        row = self.pool.query_one(
+            "SELECT COUNT(*) FROM document_files WHERE storage_key = %s", (storage_key,)
+        )
+        return int(row[0]) if row else 0
+
+    def delete(self, document_id: str) -> bool:
+        affected = self.pool.execute(
+            "DELETE FROM document_files WHERE document_id = %s", (document_id,)
+        )
+        return affected > 0
+
+
+def _document_file(row: tuple[Any, ...] | None) -> DocumentFileRecord | None:
+    if row is None:
+        return None
+    return DocumentFileRecord(
+        document_id=str(row[0]),
+        storage_key=str(row[1]),
+        sha256=str(row[2]),
+        byte_size=int(row[3]),
+        content_type=str(row[4]),
+        source_name=str(row[5]),
+        created_at=row[6],
+        updated_at=row[7],
+    )
 
 
 class DocumentContentRepository:
@@ -535,6 +738,19 @@ class ChunkRepository:
         return self.pool.execute(
             "DELETE FROM document_chunks WHERE index_version = %s", (index_version,)
         )
+
+    def count_for_version(self, index_version: str, *, chunk_role: str | None = None) -> int:
+        """该 index version 的分块行数（可按角色过滤）；完整性校验用（ADR-036 决策 4）。"""
+
+        parameters: list[Any] = [index_version]
+        clause = ""
+        if chunk_role is not None:
+            clause = " AND chunk_role = %s"
+            parameters.append(chunk_role)
+        row = self.pool.query_one(
+            f"SELECT COUNT(*) FROM document_chunks WHERE index_version = %s{clause}", parameters
+        )
+        return int(row[0]) if row else 0
 
 
 def _document(row: tuple[Any, ...] | None) -> DocumentRecord | None:

@@ -59,6 +59,14 @@ def create_run(
         client_metadata=payload.client_metadata,
     )
     if not dispatcher.dispatch(handle.run_id):
+        # 调度容量耗尽：这个 Run 永远不会开始执行，必须以安全终态收口（带终态事件），
+        # 而不是停留在 ``accepted``；普通 Run 不在维护任务的恢复范围内，没有其他补救路径。
+        container.runs.fail_run_safely(
+            handle.run_id,
+            code="scheduler_unavailable",
+            message="The run could not be scheduled; please retry.",
+            required_status="accepted",
+        )
         raise conflict("The run could not be scheduled; please retry.")
     return RunAcceptedResponse(
         conversation_id=handle.conversation_id,
@@ -98,7 +106,9 @@ async def stream_run_events(
 
     async def event_stream() -> AsyncIterator[bytes]:
         # 先补发历史事件再订阅实时事件；终态 Run 无需订阅，避免挂起空闲连接。
+        last_replayed_sequence = 0
         for envelope in history:
+            last_replayed_sequence = envelope.sequence
             yield envelope.to_sse().encode("utf-8")
         if run.status in {"completed", "rejected", "failed", "expired", "handoff_complete"}:
             return
@@ -119,6 +129,12 @@ async def stream_run_events(
                         return
                     yield b": keep-alive\n\n"
                     continue
+                if envelope.sequence <= last_replayed_sequence:
+                    # 订阅通道可能仍持有补发窗口内的事件（读历史与订阅之间的竞态）；
+                    # 这些事件已按 sequence 顺序补发过，必须丢弃，保证该 Run 的流严格递增
+                    # 且不重复投递同一个 sequence。
+                    continue
+                last_replayed_sequence = envelope.sequence
                 yield envelope.to_sse().encode("utf-8")
                 if envelope.event_type == "approval_required":
                     # 暂停点已送达；决策后客户端改为监听后继 Run 的流。

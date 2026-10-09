@@ -11,6 +11,7 @@ from backend.infrastructure.parsers import (
     LightweightParser,
     MinerUParser,
     ParserError,
+    RoutedParser,
     chunk_document,
     create_parser,
     supported_content_type,
@@ -112,6 +113,24 @@ class _FakeResponse:
             raise real_httpx.HTTPError(f"fake status {self.status_code}")
 
 
+class _FakeStreamResponse:
+    """``httpx.stream`` 的响应替身：支持有界迭代读取与 headers。"""
+
+    def __init__(self, *, content: bytes, status_code: int = 200, headers=None) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise real_httpx.HTTPError(f"fake status {self.status_code}")
+
+    def iter_bytes(self, chunk_size: int | None = None):
+        size = chunk_size or 65536
+        for start in range(0, len(self.content), size):
+            yield self.content[start : start + size]
+
+
 class _FakeHTTPX:
     """记录调用并回放预置响应的 httpx 替身。"""
 
@@ -123,6 +142,7 @@ class _FakeHTTPX:
         poll_responses=None,
         default_poll: _FakeResponse | None = None,
         zip_response: _FakeResponse | None = None,
+        zip_headers: dict | None = None,
     ) -> None:
         self.HTTPError = real_httpx.HTTPError
         self.calls: list[tuple] = []
@@ -131,6 +151,7 @@ class _FakeHTTPX:
         self._poll = list(poll_responses or [])
         self._default_poll = default_poll
         self._zip = zip_response or _FakeResponse()
+        self._zip_headers = zip_headers or {}
 
     def post(self, url, headers=None, json=None, timeout=None):
         self.calls.append(("post", url, dict(headers or {}), json))
@@ -147,6 +168,25 @@ class _FakeHTTPX:
         if self._default_poll is not None:
             return self._default_poll
         return self._zip
+
+    def stream(self, method, url, timeout=None, follow_redirects=None):
+        self.calls.append(("stream", url, {}, None))
+        content = getattr(self._zip, "content", b"")
+        response = _FakeStreamResponse(content=content, headers=dict(self._zip_headers))
+        return _FakeStream(response)
+
+
+class _FakeStream:
+    """``httpx.stream`` 的上下文管理器替身。"""
+
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+
+    def __enter__(self) -> _FakeStreamResponse:
+        return self._response
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
 
 
 def _zip_with_markdown(text: str) -> bytes:
@@ -197,7 +237,7 @@ def test_mineru_parser_uploads_polls_and_reads_markdown(monkeypatch):
     assert "MinerU Result" in parsed.text
     assert "Body text" in parsed.text  # 文本经过规范化
     kinds = [call[0] for call in fake.calls]
-    assert kinds == ["post", "put", "get", "get", "get"]
+    assert kinds == ["post", "put", "get", "get", "stream"]
     # 预签名上传绝不能携带 Authorization（官方文档：双重鉴权会被 403 拒绝）。
     assert "Authorization" not in fake.calls[1][2]
     # 申请上传与轮询必须携带 Bearer Token。
@@ -267,8 +307,202 @@ def test_create_parser_wires_mineru_settings():
         mineru_base_url="https://mineru.net/api/v4",
         mineru_api_key="token-1",
         mineru_model_version="vlm",
+        mineru_max_bytes=2048,
     )
     parser = create_parser(settings)
-    assert isinstance(parser, MinerUParser)
-    assert parser.model_version == "vlm"
-    assert parser.api_key == "token-1"
+    # MinerU 档位返回路由 parser：文本类走本地，其余走远端（ADR-036 决策 5）。
+    assert isinstance(parser, RoutedParser)
+    assert isinstance(parser.remote, MinerUParser)
+    assert parser.remote.model_version == "vlm"
+    assert parser.remote.api_key == "token-1"
+    # 远端 adapter 收到的是**远端单份硬限**，不是本地接受上限。
+    assert parser.remote.max_bytes == 2048
+    assert parser.provider_for(filename="a.md", content_type="text/markdown") == "lightweight"
+    assert parser.provider_for(filename="a.pdf", content_type="application/pdf") == "mineru"
+
+
+def test_create_parser_without_mineru_returns_local_parser():
+    settings = Settings(_env_file=None, parser_provider="lightweight")
+    parser = create_parser(settings)
+    assert isinstance(parser, LightweightParser)
+    assert parser.provider_for(filename="a.pdf", content_type="application/pdf") == "lightweight"
+
+
+# ---- ADR-036：显式预算、远端硬限与结果归档边界 ---------------------------------
+
+
+def test_lightweight_parser_fails_explicitly_instead_of_truncating():
+    parser = LightweightParser(max_bytes=1024 * 1024, max_chars=50)
+    with pytest.raises(ParserError) as failure:
+        parser.parse(filename="a.md", content_type="text/markdown", data=("x" * 200).encode())
+    assert str(failure.value) == "extracted_text_too_large"
+
+
+def test_routed_parser_sends_text_locally_and_documents_remotely(monkeypatch):
+    fake = _FakeHTTPX(
+        post_response=_FakeResponse(
+            payload={"code": 0, "data": {"batch_id": "b-r", "file_urls": ["https://up.example/p"]}}
+        ),
+        poll_responses=[
+            _FakeResponse(
+                payload={
+                    "code": 0,
+                    "data": {
+                        "extract_result": [
+                            {"state": "done", "full_zip_url": "https://cdn.example/full.zip"}
+                        ]
+                    },
+                }
+            )
+        ],
+        zip_response=_FakeResponse(content=_zip_with_markdown("# Remote\n")),
+    )
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", fake)
+    parser = RoutedParser(
+        local=LightweightParser(max_bytes=1024 * 1024, max_chars=1000),
+        remote=_mineru_parser(),
+    )
+    # 文本类：本地解析，绝不触网（MinerU v4 不支持文本类，此前会必然失败）。
+    local_parsed = parser.parse(
+        filename="notes.md", content_type="text/markdown", data=b"# Local\n\nBody"
+    )
+    assert local_parsed.parser == "lightweight"
+    assert fake.calls == []
+    # 其余类型：走远端 provider。
+    remote_parsed = parser.parse(
+        filename="paper.pdf", content_type="application/pdf", data=b"%PDF-fake"
+    )
+    assert remote_parsed.parser == "mineru"
+    assert [call[0] for call in fake.calls] == ["post", "put", "get", "stream"]
+
+
+def test_mineru_parser_rejects_files_above_the_provider_limit_without_calling_out(monkeypatch):
+    fake = _FakeHTTPX(post_response=_FakeResponse(payload={"code": 0, "data": {}}))
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", fake)
+    parser = MinerUParser(
+        base_url="https://mineru.net/api/v4",
+        api_key="token",
+        model_version="pipeline",
+        timeout_seconds=5.0,
+        max_bytes=10,
+        poll_interval_seconds=0.01,
+    )
+    with pytest.raises(ParserError) as failure:
+        parser.parse(filename="big.pdf", content_type="application/pdf", data=b"x" * 64)
+    assert str(failure.value) == "document_exceeds_parser_limit"
+    assert fake.calls == []
+
+
+def test_mineru_parser_bounds_zip_entries_and_paths(monkeypatch):
+    def parser_with(**kwargs) -> MinerUParser:
+        return MinerUParser(
+            base_url="https://mineru.net/api/v4",
+            api_key="token",
+            model_version="pipeline",
+            timeout_seconds=5.0,
+            max_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            **kwargs,
+        )
+
+    poll = _FakeResponse(
+        payload={
+            "code": 0,
+            "data": {
+                "extract_result": [
+                    {"state": "done", "full_zip_url": "https://cdn.example/full.zip"}
+                ]
+            },
+        }
+    )
+    post = _FakeResponse(
+        payload={"code": 0, "data": {"batch_id": "b-z", "file_urls": ["https://up.example/p"]}}
+    )
+
+    # 目录越界：整份结果被拒绝。
+    traversal = io.BytesIO()
+    with zipfile.ZipFile(traversal, "w") as archive:
+        archive.writestr("../evil.md", "# Evil")
+    monkeypatch.setattr(
+        "backend.infrastructure.parsers.httpx",
+        _FakeHTTPX(
+            post_response=post,
+            poll_responses=[poll],
+            zip_response=_FakeResponse(content=traversal.getvalue()),
+        ),
+    )
+    with pytest.raises(ParserError) as traversal_failure:
+        parser_with().parse(filename="a.pdf", content_type="application/pdf", data=b"%PDF")
+    assert str(traversal_failure.value) == "parser_result_unsafe"
+
+    # 条目数超限：由 parser 的上限参数控制。
+    many = io.BytesIO()
+    with zipfile.ZipFile(many, "w") as archive:
+        for index in range(6):
+            archive.writestr(f"part-{index}.md", "# part")
+    monkeypatch.setattr(
+        "backend.infrastructure.parsers.httpx",
+        _FakeHTTPX(
+            post_response=post,
+            poll_responses=[poll],
+            zip_response=_FakeResponse(content=many.getvalue()),
+        ),
+    )
+    with pytest.raises(ParserError) as entries_failure:
+        parser_with(max_zip_entries=5).parse(
+            filename="a.pdf", content_type="application/pdf", data=b"%PDF"
+        )
+    assert str(entries_failure.value) == "parser_result_too_large"
+
+    # 声明长度超限：下载前即拒绝。
+    oversized = _FakeHTTPX(
+        post_response=post,
+        poll_responses=[poll],
+        zip_response=_FakeResponse(content=_zip_with_markdown("# ok")),
+        zip_headers={"content-length": "999999999999"},
+    )
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", oversized)
+    with pytest.raises(ParserError) as declared_failure:
+        parser_with().parse(filename="a.pdf", content_type="application/pdf", data=b"%PDF")
+    assert str(declared_failure.value) == "parser_result_too_large"
+
+    # 归档内 Markdown 条目超过上限。
+    big_entry = _FakeHTTPX(
+        post_response=post,
+        poll_responses=[poll],
+        zip_response=_FakeResponse(content=_zip_with_markdown("x" * 512)),
+    )
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", big_entry)
+    with pytest.raises(ParserError) as entry_failure:
+        MinerUParser(
+            base_url="https://mineru.net/api/v4",
+            api_key="token",
+            model_version="pipeline",
+            timeout_seconds=5.0,
+            max_bytes=1024 * 1024,
+            poll_interval_seconds=0.01,
+            max_markdown_entry_bytes=64,
+        ).parse(filename="a.pdf", content_type="application/pdf", data=b"%PDF")
+    assert str(entry_failure.value) == "parser_result_too_large"
+
+
+def test_mineru_parser_rejects_unsupported_result_url_scheme(monkeypatch):
+    fake = _FakeHTTPX(
+        post_response=_FakeResponse(
+            payload={"code": 0, "data": {"batch_id": "b-s", "file_urls": ["https://up.example/p"]}}
+        ),
+        poll_responses=[
+            _FakeResponse(
+                payload={
+                    "code": 0,
+                    "data": {
+                        "extract_result": [{"state": "done", "full_zip_url": "file:///etc/passwd"}]
+                    },
+                }
+            )
+        ],
+    )
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", fake)
+    with pytest.raises(ParserError) as failure:
+        _mineru_parser().parse(filename="a.pdf", content_type="application/pdf", data=b"%PDF")
+    assert str(failure.value) == "parser_result_unsafe"

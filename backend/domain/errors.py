@@ -25,6 +25,19 @@ class RecoverableFailure(Exception):
     """显式的瞬时失败，可进入 Graph/Application 的 repair 预算。"""
 
 
+class ExecutionOwnershipLost(Exception):
+    """执行者已失去执行所有权（CR-RUNTIME-20261009-01 / ADR-035）。
+
+    它不是对外的 API 错误：它是「该执行者不得继续写入」的内部信号。
+    提交点（事件、等待态、终态、promote、清理）在所有权校验失败时抛出它，
+    调用方必须放弃写入，而不是把它转换成用户可见的失败。
+    """
+
+    def __init__(self, subject_id: str) -> None:
+        super().__init__(f"Execution ownership was lost: {subject_id}")
+        self.subject_id = subject_id
+
+
 class AppError(Exception):
     """应用层失败，携带规范化的错误码与映射后的 HTTP 状态码。"""
 

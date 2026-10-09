@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -12,7 +12,7 @@ CheckpointMode = Literal["memory", "sqlite"]
 @contextmanager
 def checkpoint_context(
     mode: CheckpointMode, sqlite_path: Path | str | None = None
-) -> Iterator[object]:
+) -> Generator[object, None, None]:
     """提供已批准的 Memory 与 SQLite 模式，同时不把 Checkpoint 变成 Graph Node。"""
     if mode == "memory":
         yield InMemorySaver()
@@ -29,7 +29,7 @@ def checkpoint_context(
 @contextmanager
 def open_checkpointer(
     mode: CheckpointMode, sqlite_path: Path | str | None = None
-) -> Iterator[object]:
+) -> Generator[object, None, None]:
     """进程级长期存活的 Checkpoint 句柄；运行时停止时关闭。"""
 
     with checkpoint_context(mode, sqlite_path) as saver:

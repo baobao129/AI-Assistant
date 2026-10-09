@@ -13,7 +13,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -133,7 +133,7 @@ class MySQLConnectionPool:
         return connection
 
     @contextmanager
-    def connection(self) -> Iterator[pymysql.connections.Connection]:
+    def connection(self) -> Generator[pymysql.connections.Connection, None, None]:
         try:
             connection = self._available.get_nowait()
         except queue.Empty:
@@ -155,7 +155,7 @@ class MySQLConnectionPool:
                 _close_quietly(connection)
 
     @contextmanager
-    def cursor(self, *, dictionary: bool = False) -> Iterator[pymysql.cursors.Cursor]:
+    def cursor(self, *, dictionary: bool = False) -> Generator[pymysql.cursors.Cursor, None, None]:
         with self.connection() as connection:
             cursor = connection.cursor(
                 pymysql.cursors.DictCursor if dictionary else pymysql.cursors.Cursor
@@ -164,6 +164,29 @@ class MySQLConnectionPool:
                 yield cursor
             finally:
                 cursor.close()
+
+    @contextmanager
+    def transaction(self) -> Generator[pymysql.cursors.Cursor, None, None]:
+        """在一个应用账号连接上执行原子事务：正常退出提交，异常回滚。
+
+        HITL 决策与其 successor Run 的创建必须共享同一个事务边界：进程在任一步骤
+        退出时整体回滚，绝不留下「approved 但没有 successor」的不可恢复中间态。
+        连接上的 autocommit 设置会在事务结束后恢复。
+        """
+
+        with self.connection() as connection:
+            previous_autocommit = connection.get_autocommit()
+            connection.autocommit(False)
+            cursor = connection.cursor()
+            try:
+                yield cursor
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+                connection.autocommit(previous_autocommit)
 
     def discard_current_connection(self) -> None:
         """请求连接池丢弃当前上下文正在使用的连接。"""
