@@ -227,6 +227,40 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
+    CREATE TABLE IF NOT EXISTS ingestion_shards (
+      shard_id VARCHAR(36) NOT NULL PRIMARY KEY,
+      ingestion_job_id VARCHAR(36) NOT NULL,
+      document_id VARCHAR(36) NOT NULL,
+      index_version VARCHAR(36) NOT NULL,
+      shard_index INT NOT NULL,
+      -- 页范围是 1-based 闭区间；非 PDF（或未知页码）时为 NULL，绝不伪造成第 1 页。
+      page_start INT NULL,
+      page_end INT NULL,
+      byte_size BIGINT NOT NULL,
+      -- 分片字节的 sha256：与 parser_provider/parser_options 一起构成复用键（ADR-037）。
+      sha256 CHAR(64) NOT NULL,
+      parser_provider VARCHAR(40) NOT NULL,
+      parser_options VARCHAR(120) NOT NULL,
+      -- provider batch id：submit 之后立刻写入；轮询超时不等于任务未创建，重试据此续轮询。
+      provider_batch_id VARCHAR(120) NULL,
+      status VARCHAR(20) NOT NULL,
+      reused TINYINT(1) NOT NULL DEFAULT 0,
+      attempt INT NOT NULL DEFAULT 0,
+      char_count INT NOT NULL DEFAULT 0,
+      extracted_text MEDIUMTEXT NULL,
+      -- provider 结构化块（ADR-038）：复用分片时取回同样的结构，避免「首次结构化、
+      -- 重建索引回退文本」的行为不一致；超预算时不写入并记录回退。
+      blocks_json MEDIUMTEXT NULL,
+      failure_code VARCHAR(64) NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      finished_at DATETIME(6) NULL,
+      UNIQUE KEY uq_shards_version_index (index_version, shard_index),
+      KEY ix_shards_reuse (sha256, parser_provider, parser_options),
+      KEY ix_shards_job (ingestion_job_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
     CREATE TABLE IF NOT EXISTS document_contents (
       document_id VARCHAR(36) NOT NULL PRIMARY KEY,
       extracted_text MEDIUMTEXT NOT NULL,
@@ -249,6 +283,14 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       content MEDIUMTEXT NOT NULL,
       location VARCHAR(120) NULL,
       label VARCHAR(200) NOT NULL,
+      -- 结构元数据（ADR-038，全部为增列）：章节路径、块类型、真实页范围、内容 hash 与
+      -- token 估计。没有可靠来源时为 NULL/默认值，绝不伪造页码或章节。
+      section_path VARCHAR(300) NULL,
+      block_type VARCHAR(20) NOT NULL DEFAULT 'paragraph',
+      page_start INT NULL,
+      page_end INT NULL,
+      content_hash CHAR(64) NULL,
+      token_count INT NOT NULL DEFAULT 0,
       created_at DATETIME(6) NOT NULL,
       KEY ix_chunks_version (index_version, chunk_role, ordinal),
       KEY ix_chunks_parent (parent_chunk_id)
@@ -319,6 +361,45 @@ EXPANSION_COLUMNS: tuple[tuple[str, str, str], ...] = (
         "ingestion_jobs",
         "heartbeat_at",
         "ALTER TABLE ingestion_jobs ADD COLUMN heartbeat_at DATETIME(6) NULL",
+    ),
+    # 结构分块的增列（ADR-038 决策 8）：既有库通过幂等 ADD COLUMN 补齐，
+    # 旧行保持 NULL/默认值，读路径语义不变。
+    (
+        "document_chunks",
+        "section_path",
+        "ALTER TABLE document_chunks ADD COLUMN section_path VARCHAR(300) NULL",
+    ),
+    (
+        "document_chunks",
+        "block_type",
+        "ALTER TABLE document_chunks ADD COLUMN block_type VARCHAR(20) "
+        "NOT NULL DEFAULT 'paragraph'",
+    ),
+    (
+        "document_chunks",
+        "page_start",
+        "ALTER TABLE document_chunks ADD COLUMN page_start INT NULL",
+    ),
+    (
+        "document_chunks",
+        "page_end",
+        "ALTER TABLE document_chunks ADD COLUMN page_end INT NULL",
+    ),
+    (
+        "document_chunks",
+        "content_hash",
+        "ALTER TABLE document_chunks ADD COLUMN content_hash CHAR(64) NULL",
+    ),
+    (
+        "document_chunks",
+        "token_count",
+        "ALTER TABLE document_chunks ADD COLUMN token_count INT NOT NULL DEFAULT 0",
+    ),
+    # 分片 manifest 的结构化块列（ADR-038）：既有库幂等补列。
+    (
+        "ingestion_shards",
+        "blocks_json",
+        "ALTER TABLE ingestion_shards ADD COLUMN blocks_json MEDIUMTEXT NULL",
     ),
 )
 

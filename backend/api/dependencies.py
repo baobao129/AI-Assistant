@@ -68,6 +68,7 @@ def build_tool_registry(runtime: Runtime):
                 documents=runtime.documents,
                 chunks=runtime.chunks,
                 registry=runtime.registry,
+                reranker=runtime.reranker,
             ),
             DatabaseSchemaTool(settings=runtime.settings, query_runner=runtime.query_runner),
             DatabaseQueryTool(
@@ -113,6 +114,8 @@ def build_container(settings: Settings) -> Container:
         tool_executor=tools,
         # 终态转换的事务边界：Run 终态与其终态事件必须同一事务提交。
         pool=runtime.application_pool,
+        # 父块提供者（ADR-038）：RAG 子图据此展开真实父块，而不是只做直通过滤。
+        parent_context=runtime.parent_context,
     )
     approvals = ApprovalService(
         approvals=runtime.approvals,
@@ -179,7 +182,13 @@ class RunDispatcher:
     def __post_init__(self) -> None:
         self._semaphore = threading.BoundedSemaphore(self.max_concurrent)
 
-    def dispatch(self, run_id: str, *, approval_request_id: str | None = None) -> bool:
+    def dispatch(
+        self,
+        run_id: str,
+        *,
+        approval_request_id: str | None = None,
+        document_scope: tuple[str, ...] = (),
+    ) -> bool:
         # 信号量限制并发执行数；容量耗尽时立即失败，由上层返回 conflict，绝不无限排队。
         if not self._semaphore.acquire(blocking=False):
             logger.warning("run_dispatcher_capacity_exhausted")
@@ -189,21 +198,31 @@ class RunDispatcher:
         owner_token = new_id()
         thread = threading.Thread(
             target=self._execute,
-            args=(run_id, approval_request_id, owner_token),
+            args=(run_id, approval_request_id, owner_token, document_scope),
             name=f"run-{run_id[:8]}",
             daemon=True,
         )
         thread.start()
         return True
 
-    def _execute(self, run_id: str, approval_request_id: str | None, owner_token: str) -> None:
+    def _execute(
+        self,
+        run_id: str,
+        approval_request_id: str | None,
+        owner_token: str,
+        document_scope: tuple[str, ...] = (),
+    ) -> None:
         try:
             if approval_request_id:
+                # 审批 successor 走 resume：作用域从**同一个 Thread 的 Checkpoint**
+                # 恢复，因此这里刻意不传，避免用空值覆盖已恢复的作用域（ADR-039）。
                 self.container.runs.resume(
                     run_id, approval_request_id=approval_request_id, owner_token=owner_token
                 )
             else:
-                self.container.runs.execute(run_id, owner_token=owner_token)
+                self.container.runs.execute(
+                    run_id, owner_token=owner_token, document_scope=document_scope
+                )
         except Exception as error:  # noqa: BLE001 - background execution must not crash
             logger.warning("run_dispatch_failed: %s", type(error).__name__)
             # 异常兜底：绝不允许后台执行异常留下永久 ``running``。以安全终态收口并写入

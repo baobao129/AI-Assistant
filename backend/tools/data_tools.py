@@ -30,6 +30,7 @@ from backend.infrastructure.repositories.structured import (
     ExportArtifactRepository,
     QueryResultRepository,
 )
+from backend.infrastructure.reranker import Reranker, RerankerError
 from backend.infrastructure.vector_store import VectorStore, VectorStoreError, collection_name
 from backend.tools.contracts import (
     RegisteredTool,
@@ -78,7 +79,7 @@ class DataExportInput(BaseModel):
 
 
 class KnowledgeSearchTool(RegisteredTool):
-    """在 Child Chunk 上的稠密检索，Parent 映射交由 Graph 处理。"""
+    """在授权 Child 上融合 Dense/BM25 并重排，Parent 映射交由 Graph 处理。"""
 
     metadata = ToolMetadata("knowledge_search", "1", "low", "knowledge_retrieval")
     input_model = KnowledgeSearchInput
@@ -98,6 +99,7 @@ class KnowledgeSearchTool(RegisteredTool):
         documents: DocumentRepository,
         chunks: ChunkRepository,
         registry: IndexRegistry,
+        reranker: Reranker | None = None,
     ) -> None:
         self.settings = settings
         self.embeddings = embeddings
@@ -108,6 +110,7 @@ class KnowledgeSearchTool(RegisteredTool):
         # 显式 index_version 的生命周期与授权判定复用 application 层的 Index Registry，
         # 不复制第二套版本授权逻辑。
         self.registry = registry
+        self.reranker = reranker
 
     def execute(
         self,
@@ -118,6 +121,17 @@ class KnowledgeSearchTool(RegisteredTool):
         started = time.monotonic()
         top_k = min(arguments.top_k, self.settings.max_retrieval_top_k)
         documents = self._authorized_documents(arguments, context)
+        # 文档作用域（ADR-039 / CC-TOOL-003）：请求了非空作用域、但当前可用授权集合与它
+        # 的交集为空时，返回**明确的拒绝**而不是空成功结果 —— 后者会被读成「文档里没有
+        # 答案」。这一步在任何 provider 调用（embedding / vector store）之前，
+        # 因此拒绝路径不会产生任何 Dense、BM25、Milvus、Reranker 或 LLM 调用。
+        scope_requested = bool(arguments.document_ids)
+        if scope_requested and not documents:
+            return self._rejected(
+                tool_call_id,
+                "document_scope_unavailable",
+                "One or more selected documents are not available for this request.",
+            )
 
         # 显式版本的生命周期与授权判定先于任何检索执行（也先于任何早期空结果返回）：
         # active + available + authorized 三者缺一都会被拒绝，绝不通过「先查询再过滤结果」
@@ -139,21 +153,18 @@ class KnowledgeSearchTool(RegisteredTool):
                 return self._rejected(
                     tool_call_id, "index_version_not_active", "That index version is not active."
                 )
+            if explicit_version.document_id not in {document.document_id for document in documents}:
+                return self._rejected(
+                    tool_call_id,
+                    "document_scope_unavailable",
+                    "One or more selected documents are not available for this request.",
+                )
         elif not documents:
             return self._success(tool_call_id, arguments, [], started, truncated=False)
 
-        try:
-            embedding = self.embeddings.embed(arguments.query)
-        except EmbeddingProviderError as error:
-            return self._failed(
-                tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
-            )
-        default_collection = self._collection_for(embedding)
-        # 查询向量的 embedding 元信息是兼容性判定的基准：provider/model/dimension 三者
-        # 全部一致的 index version 才允许被该查询向量检索（PROJECT_SPEC §8/§9：模型或维度
-        # 变化会生成新的集合/版本，历史版本仍保留在库中，不能因此让整次检索失败）。
-        query_meta = (self.embeddings.provider_name, self.embeddings.model, len(embedding))
-
+        # 候选版本在 **embedding 之前**计算：这样「作用域里的文档没有任何可用 active
+        # 版本」能在调用任何 provider 之前被识别并明确拒绝（ADR-039 决策 8），
+        # 而不是先花一次 embedding 再返回空结果。
         if explicit_version is not None:
             candidates = [explicit_version]
         else:
@@ -168,7 +179,27 @@ class KnowledgeSearchTool(RegisteredTool):
                     continue
                 candidates.append(version)
             if not candidates:
+                if scope_requested:
+                    # 选中的文档没有任何可用的 active 版本：明确拒绝，绝不返回空成功
+                    # 结果（那会被读成「选中的文档里没有答案」）。
+                    return self._rejected(
+                        tool_call_id,
+                        "document_scope_unavailable",
+                        "One or more selected documents are not available for this request.",
+                    )
                 return self._success(tool_call_id, arguments, [], started, truncated=False)
+
+        try:
+            embedding = self.embeddings.embed(arguments.query)
+        except EmbeddingProviderError as error:
+            return self._failed(
+                tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
+            )
+        default_collection = self._collection_for(embedding)
+        # 查询向量的 embedding 元信息是兼容性判定的基准：provider/model/dimension 三者
+        # 全部一致的 index version 才允许被该查询向量检索（PROJECT_SPEC §8/§9：模型或维度
+        # 变化会生成新的集合/版本，历史版本仍保留在库中，不能因此让整次检索失败）。
+        query_meta = (self.embeddings.provider_name, self.embeddings.model, len(embedding))
 
         # 兼容过滤发生在任何 vector search 之前：不兼容的 index version 直接跳过，
         # 绝不拿查询向量去搜索元数据不匹配的集合（那会触发向量维度错误并让整次检索失败）。
@@ -180,60 +211,175 @@ class KnowledgeSearchTool(RegisteredTool):
                 continue
             targets.append((version.index_version, version.collection_name or default_collection))
         if not targets:
-            # 全部候选版本都不兼容：安全失败（由 Graph 归一为 retrieval_unavailable），
-            # 既不检索不匹配的集合，也不允许在缺少授权证据时编造答案。
+            # 全部候选版本都不兼容：这是确定性的索引能力问题，不是瞬时 provider 故障。
+            # 既不检索不匹配的集合，也不允许 Graph 进入 repair 重试或无证据生成。
             logger.warning("knowledge_search_no_compatible_version skipped=%s", skipped)
             return self._failed(
                 tool_call_id,
-                "retrieval_unavailable",
-                "Knowledge retrieval is temporarily unavailable.",
+                "knowledge_index_incompatible",
+                "The authorized knowledge index is incompatible with the configured "
+                "embedding model.",
             )
         if skipped:
             # 有界日志：只记录被跳过的数量，不记录内容或标识符。
             logger.info("knowledge_search_skipped_incompatible_versions skipped=%s", skipped)
 
         groups = []
-        for index_version, collection in targets:
+        sparse_groups = []
+        collections: dict[str, list[str]] = {}
+        for version_id, collection in targets:
+            collections.setdefault(collection, []).append(version_id)
+        scope_search = getattr(self.vectors, "search_scope", None)
+        hybrid_collections = [name for name in collections if name.endswith("_hybrid_v1")]
+        wants_sparse = self.settings.retrieval_mode in {"dense_bm25", "hybrid_rerank"}
+        wants_rerank = self.settings.rerank_enabled and self.settings.retrieval_mode in {
+            "dense_rerank",
+            "hybrid_rerank",
+        }
+        sparse_available = wants_sparse and callable(scope_search) and len(hybrid_collections) == 1
+        window = min(
+            max(top_k, self.settings.rerank_top_n) * self.RETRIEVAL_CANDIDATE_FACTOR,
+            self.MAX_RETRIEVAL_CANDIDATES,
+        )
+        for collection, version_ids in collections.items():
             try:
-                groups.append(
-                    self._search(
-                        collection=collection,
-                        embedding=embedding,
-                        top_k=top_k,
-                        index_version=index_version,
+                if callable(scope_search):
+                    groups.append(
+                        scope_search(
+                            collection=collection,
+                            embedding=embedding,
+                            query=arguments.query,
+                            versions=tuple(version_ids),
+                            top_k=window,
+                        )
                     )
-                )
+                else:
+                    for version_id in version_ids:
+                        groups.append(
+                            self._search(
+                                collection=collection,
+                                embedding=embedding,
+                                top_k=top_k,
+                                index_version=version_id,
+                            )
+                        )
+                if sparse_available and collection in hybrid_collections:
+                    sparse_groups.append(
+                        scope_search(
+                            collection=collection,
+                            query=arguments.query,
+                            embedding=embedding,
+                            versions=tuple(version_ids),
+                            top_k=window,
+                            sparse=True,
+                        )
+                    )
             except VectorStoreError as error:
                 return self._failed(
                     tool_call_id, str(error), "Knowledge retrieval is temporarily unavailable."
                 )
 
         allowed_ids = {document.document_id for document in documents}
-        merged: dict[str, float] = {}
-        for group in groups:
-            for match in group:
-                # 除了服务端解析出的作用域外，返回的行上也会强制授权，
-                # 因此没有结果能逃逸该授权。
-                if not match.document_id or match.document_id not in allowed_ids:
-                    continue
-                if match.score > merged.get(match.chunk_id, float("-inf")):
-                    merged[match.chunk_id] = match.score
+        dense_ranked = sorted(
+            [match for group in groups for match in group],
+            key=lambda match: (-match.score, match.chunk_id),
+        )[:window]
+        sparse_ranked = [match for group in sparse_groups for match in group]
+        target_ids = {version_id for version_id, _ in targets}
+        allowed_pairs = {
+            (version.document_id, version.index_version)
+            for version in candidates
+            if version.index_version in target_ids
+        }
+        merged: dict[str, dict[str, float]] = {}
+        for rank, match in enumerate(dense_ranked, start=1):
+            if (match.document_id, match.index_version) not in allowed_pairs:
+                continue
+            item = merged.setdefault(match.chunk_id, {})
+            item["dense_score"] = max(item.get("dense_score", match.score), match.score)
+            item["dense_rank"] = min(item.get("dense_rank", float(rank)), float(rank))
+        for rank, match in enumerate(sparse_ranked, start=1):
+            if (match.document_id, match.index_version) not in allowed_pairs:
+                continue
+            item = merged.setdefault(match.chunk_id, {})
+            item["bm25_score"] = max(item.get("bm25_score", match.score), match.score)
+            item["bm25_rank"] = min(item.get("bm25_rank", float(rank)), float(rank))
         if not merged:
             return self._success(tool_call_id, arguments, [], started, truncated=False)
-        ranked = sorted(merged.items(), key=lambda item: item[1], reverse=True)
+        for scores in merged.values():
+            scores["rrf_score"] = (
+                1.0 / (60.0 + scores["dense_rank"]) if "dense_rank" in scores else 0.0
+            ) + (1.0 / (60.0 + scores["bm25_rank"]) if "bm25_rank" in scores else 0.0)
+        ranked = sorted(merged.items(), key=lambda item: (-item[1]["rrf_score"], item[0]))
 
         chunks = self.chunks.list_by_ids([chunk_id for chunk_id, _ in ranked], index_version=None)
         by_id = {chunk.chunk_id: chunk for chunk in chunks}
         results: list[dict[str, Any]] = []
-        for chunk_id, score in ranked:
+        for chunk_id, scores in ranked:
             chunk = by_id.get(chunk_id)
-            if chunk is None or chunk.document_id not in allowed_ids:
+            if (
+                chunk is None
+                or chunk.document_id not in allowed_ids
+                or (chunk.document_id, chunk.index_version) not in allowed_pairs
+            ):
                 continue
-            results.append(self._result_item(chunk, score))
-            if len(results) >= top_k:
+            document = self.documents.get(chunk.document_id)
+            if (
+                document is None
+                or document.status != "available"
+                or document.active_index_version != chunk.index_version
+            ):
+                if scope_requested:
+                    return self._rejected(
+                        tool_call_id,
+                        "document_scope_unavailable",
+                        "One or more selected documents are not available for this request.",
+                    )
+                continue
+            score = scores["rrf_score"] if sparse_available else scores.get("dense_score", 0.0)
+            results.append(self._result_item(chunk, score, scores=scores))
+            if len(results) >= min(window, max(top_k, self.settings.rerank_top_n)):
                 break
-        truncated = len(results) >= top_k
-        return self._success(tool_call_id, arguments, results, started, truncated=truncated)
+        truncated = len(results) > top_k or len(ranked) > len(results)
+        rerank_scores: dict[str, float] = {}
+        rerank_degraded = False
+        if results and wants_rerank and self.reranker is not None:
+            try:
+                texts: list[str] = []
+                remaining = self.settings.rerank_max_total_chars
+                for item in results:
+                    text = str(item["content"])[
+                        : min(remaining, self.settings.rerank_max_document_chars)
+                    ]
+                    if not text:
+                        break
+                    texts.append(text)
+                    remaining -= len(text)
+                reranked = self.reranker.rerank(
+                    arguments.query,
+                    texts,
+                    top_n=min(self.settings.rerank_top_n, len(texts)),
+                )
+                rerank_scores = {results[index]["chunk_id"]: score for index, score in reranked}
+                ordered = [results[index] for index, _ in reranked]
+                results = ordered + [item for item in results if item not in ordered]
+            except RerankerError:
+                rerank_degraded = True
+        for item in results:
+            if item["chunk_id"] in rerank_scores:
+                item["rerank_score"] = rerank_scores[item["chunk_id"]]
+            item["retrieval_mode"] = (
+                ("hybrid_rerank" if sparse_available else "dense_rerank")
+                if rerank_scores
+                else "hybrid"
+                if sparse_available
+                else "dense"
+            )
+            item["rerank_degraded"] = rerank_degraded
+            item["sparse_degraded"] = wants_sparse and not sparse_available
+            if item["chunk_id"] in rerank_scores:
+                item["scores"]["rerank_score"] = rerank_scores[item["chunk_id"]]
+        return self._success(tool_call_id, arguments, results[:top_k], started, truncated=truncated)
 
     def _collection_for(self, embedding: list[float]) -> str:
         return collection_name(
@@ -294,7 +440,11 @@ class KnowledgeSearchTool(RegisteredTool):
                 allowed.append(document)
         return allowed
 
-    def _result_item(self, chunk: ChunkRecord, score: float) -> dict[str, Any]:
+    def _result_item(
+        self, chunk: ChunkRecord, score: float, *, scores: dict[str, float] | None = None
+    ) -> dict[str, Any]:
+        # 结构元数据随结果一起返回（CC-TOOL-002）：调用方可以据此给出真实页码与章节，
+        # 而不是把 chunk 序号当定位。没有可靠来源时字段为 None，绝不伪造。
         return {
             "chunk_id": chunk.chunk_id,
             "document_id": chunk.document_id,
@@ -302,11 +452,27 @@ class KnowledgeSearchTool(RegisteredTool):
             "index_version": chunk.index_version,
             "content": chunk.content,
             "score": round(float(score), 6),
-            "metadata": {"label": chunk.label, "location": chunk.location},
+            "scores": {key: round(float(value), 6) for key, value in (scores or {}).items()},
+            "section_path": chunk.section_path,
+            "block_type": chunk.block_type,
+            "page_start": chunk.page_start,
+            "page_end": chunk.page_end,
+            "token_count": chunk.token_count,
+            "metadata": {
+                "label": chunk.label,
+                "location": chunk.location,
+                "section_path": chunk.section_path,
+                "block_type": chunk.block_type,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
+            },
             "citation": {
                 "source_id": chunk.document_id,
                 "location": chunk.location,
                 "label": chunk.label,
+                "section_path": chunk.section_path,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
             },
         }
 

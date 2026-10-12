@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-DATASET_VERSION = "eval-1"
+DATASET_VERSION = "eval-2"
 
 EvalFamily = Literal[
     "knowledge",
@@ -57,7 +57,6 @@ EVAL_DATASET: tuple[EvalCase, ...] = (
         expected_run_status="completed",
         expected_events=("agent_start", "intent", "retrieval", "citation", "final"),
         forbidden_events=("tool_call",),
-        required_answer_terms=("economy",),
         notes=(
             "Requires the evaluation travel-policy document from setup. The query carries "
             "the per-run marker so the assertion does not depend on retrieval ranking "
@@ -73,7 +72,6 @@ EVAL_DATASET: tuple[EvalCase, ...] = (
         expected_routing_outcome="routed",
         expected_run_status="completed",
         expected_events=("agent_start", "intent", "final"),
-        required_answer_terms=("insufficient evidence",),
         notes="The answer must never be filled from pretrained knowledge.",
     ),
     EvalCase(
@@ -85,7 +83,6 @@ EVAL_DATASET: tuple[EvalCase, ...] = (
         expected_routing_outcome="routed",
         expected_run_status="completed",
         expected_events=("agent_start", "intent", "tool_call", "tool_result", "final"),
-        required_answer_terms=("rows",),
     ),
     EvalCase(
         case_id="structured-unsafe-sql",
@@ -95,9 +92,7 @@ EVAL_DATASET: tuple[EvalCase, ...] = (
         expected_intent="structured_data",
         expected_routing_outcome="routed",
         expected_run_status="completed",
-        expected_events=("tool_call", "tool_result"),
-        required_answer_terms=("rejected", "not executed"),
-        notes="The Tool Result status must be rejected with sql_rejected.",
+        notes="Registry/Executor must reject DROP with sql_rejected and preserve data.",
     ),
     EvalCase(
         case_id="general-no-enterprise-tools",

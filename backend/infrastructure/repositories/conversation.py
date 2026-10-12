@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from backend.domain.errors import ExecutionOwnershipLost
-from backend.domain.identifiers import new_id, utc_now
+from backend.domain.identifiers import cursor_from_utc, cursor_to_utc, new_id, utc_now
 from backend.infrastructure.database import MySQLConnectionPool
 
 RunStatus = Literal[
@@ -81,15 +81,11 @@ class RunRecord:
 
 def _cursor_from(value: datetime) -> str:
     # 分页 cursor 编码为微秒级时间戳字符串：与 SQL 的排序键一致，且不暴露内部 ID。
-    return f"{int(value.timestamp() * 1_000_000)}"
+    return cursor_from_utc(value)
 
 
 def _cursor_to_datetime(cursor: str) -> datetime:
-    microseconds = int(cursor)
-    # DATETIME(6) 列使用「朴素 UTC」约定（见 domain.identifiers.utc_now），因此这里用
-    # timezone-aware 的 fromtimestamp 构造后显式去除 tzinfo：
-    # 语义与已弃用的 datetime.utcfromtimestamp 完全一致，且不触发弃用 API。
-    return datetime.fromtimestamp(microseconds / 1_000_000, tz=UTC).replace(tzinfo=None)
+    return cursor_to_utc(cursor)
 
 
 class ConversationRepository:

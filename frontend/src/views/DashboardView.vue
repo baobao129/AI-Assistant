@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { CheckCircle2, CircleAlert, Database, MessagesSquare, RefreshCw, Server } from '@lucide/vue'
 import { api } from '../api'
+import { statusLabel } from '../labels'
 
 const health = ref(null)
 const conversations = ref([])
@@ -10,7 +11,7 @@ const loading = ref(false)
 const error = ref('')
 const checkedAt = ref(null)
 const services = computed(() => [
-  { name: 'Backend', key: 'backend', icon: Server },
+  { name: '后端服务', key: 'backend', icon: Server },
   { name: 'MySQL', key: 'mysql', icon: Database },
   { name: 'Milvus', key: 'milvus', icon: Database },
 ])
@@ -28,12 +29,12 @@ async function refresh() {
       api.listDocuments(5).catch(() => ({ items: [] })),
     ])
     health.value = status.services ? status : null
-    error.value = status.failure ? 'Dependency status unavailable' : ''
+    error.value = status.failure ? '无法读取服务状态' : ''
     conversations.value = conversationPage.items || []
     documents.value = documentPage.items || []
   } catch {
     health.value = null
-    error.value = 'Status unavailable'
+    error.value = '状态暂不可用'
   } finally {
     checkedAt.value = new Date()
     loading.value = false
@@ -50,8 +51,8 @@ onUnmounted(() => clearInterval(timer))
 
 <template>
   <div class="heading">
-    <div><p class="eyebrow">Operations</p><h1>System status</h1></div>
-    <button class="icon-button" :disabled="loading" title="Refresh status" aria-label="Refresh status" @click="refresh">
+    <div><p class="eyebrow">运行状态</p><h1>系统状态</h1></div>
+    <button class="icon-button" :disabled="loading" title="刷新状态" aria-label="刷新状态" @click="refresh">
       <RefreshCw :size="20" :class="{ spinning: loading }" />
     </button>
   </div>
@@ -60,13 +61,13 @@ onUnmounted(() => clearInterval(timer))
     <CircleAlert v-else :size="24" />
     <div>
       <h2>
-        {{ loading && !checkedAt ? 'Checking services' : error || (health?.status === 'healthy' ? 'All services operational' : 'Service attention required') }}
+        {{ loading && !checkedAt ? '正在检查服务' : error || (health?.status === 'healthy' ? '所有服务运行正常' : '部分服务需要检查') }}
       </h2>
-      <p>{{ checkedAt ? `Last checked ${checkedAt.toLocaleTimeString()}` : 'Pending check' }}</p>
+      <p>{{ checkedAt ? `检查时间 ${checkedAt.toLocaleTimeString('zh-CN')}` : '等待检查' }}</p>
     </div>
   </section>
   <section aria-labelledby="services-heading">
-    <h2 id="services-heading" class="section-title">Services</h2>
+    <h2 id="services-heading" class="section-title">服务</h2>
     <ul class="service-list">
       <li v-for="service in services" :key="service.key">
         <component :is="service.icon" :size="22" aria-hidden="true" />
@@ -74,15 +75,15 @@ onUnmounted(() => clearInterval(timer))
         <span class="status" :class="{ healthy: health?.services[service.key] === 'healthy' }">
           <CheckCircle2 v-if="health?.services[service.key] === 'healthy'" :size="16" />
           <CircleAlert v-else :size="16" />
-          {{ health?.services[service.key] === 'healthy' ? 'Operational' : (loading && !checkedAt ? 'Checking' : 'Unavailable') }}
+          {{ health?.services[service.key] === 'healthy' ? '正常' : (loading && !checkedAt ? '检查中' : '不可用') }}
         </span>
       </li>
     </ul>
   </section>
   <section class="split">
     <div>
-      <h2 class="section-title">Recent conversations</h2>
-      <p v-if="!conversations.length" class="muted">No conversations yet.</p>
+      <h2 class="section-title">最近对话</h2>
+      <p v-if="!conversations.length" class="muted">暂无对话。</p>
       <ul class="plain-list">
         <li v-for="item in conversations" :key="item.conversation_id">
           <MessagesSquare :size="18" aria-hidden="true" />
@@ -94,13 +95,13 @@ onUnmounted(() => clearInterval(timer))
       </ul>
     </div>
     <div>
-      <h2 class="section-title">Recent documents</h2>
-      <p v-if="!documents.length" class="muted">No documents indexed yet.</p>
+      <h2 class="section-title">最近文档</h2>
+      <p v-if="!documents.length" class="muted">暂无文档。</p>
       <ul class="plain-list">
         <li v-for="item in documents" :key="item.document_id">
           <Database :size="18" aria-hidden="true" />
           <span>{{ item.title }}</span>
-          <span class="muted">{{ item.status }}</span>
+          <span class="muted">{{ statusLabel(item.status) }}</span>
         </li>
       </ul>
     </div>

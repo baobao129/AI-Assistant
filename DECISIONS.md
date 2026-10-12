@@ -1204,7 +1204,7 @@ answer streaming. `Change ID: CR-PRODUCT-20261009-01`.
 ### Consequences
 
 Governance text (`AGENTS.md`, `PROJECT_SPEC.md`, `MASTER_AGENT_PROMPT.md`, `README.md`) now
-matches the authorized scope; the phase plan (`docs/POST_MVP_DEVELOPMENT_PLAN.md`) and the
+matches the authorized scope; the phase plan (`docs/开发计划/POST_MVP_DEVELOPMENT_PLAN.md`) and the
 implementation registry (`docs/POST_MVP_CHANGE_RECORDS.md`) carry the per-area impact analysis,
 migration, rollback, and test plans. Existing runtime behavior is unchanged by this ADR; each
 capability becomes real only when its phase is implemented, tested, and recorded.
@@ -1220,7 +1220,7 @@ updated Contract Change Record.
 - [PROJECT_SPEC.md](docs/PROJECT_SPEC.md)
 - [AGENTS.md](AGENTS.md)
 - [MASTER_AGENT_PROMPT.md](docs/MASTER_AGENT_PROMPT.md)
-- [POST_MVP_DEVELOPMENT_PLAN.md](docs/POST_MVP_DEVELOPMENT_PLAN.md)
+- [POST_MVP_DEVELOPMENT_PLAN.md](docs/开发计划/POST_MVP_DEVELOPMENT_PLAN.md)
 - [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md)
 
 ## ADR-034
@@ -1508,3 +1508,543 @@ policy requires Ingestion/API review with an updated `CR-*`/`CC-*` record.
 - [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md) (parser adapter boundary)
 - [AGENTS.md](AGENTS.md) (Ingestion and Data Lifecycle rules, Version Verification)
 - [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md) (`CR-INGEST-20261009-01`)
+
+## ADR-037
+
+### Title
+
+PDF page counting, dual-limit sharding, a persistent shard manifest with reuse and resume, and honest page mapping
+
+### Status
+
+Accepted
+
+### Context
+
+`CR-INGEST-20261009-01` batch 2 requires whole-document ingestion for documents that exceed the
+provider's per-file bounds. The P0 audit left three unresolved facts. First, the 313-page sample
+failed with `parse_failed` in six seconds and the code could not distinguish "page limit exceeded"
+from "damaged file", because every non-zero provider outcome collapsed into one code
+(`POST_MVP_PROGRESS.md` §1.4). Second, `ParsedDocument.pages` was hardcoded to `1` (G5), so no
+page information existed anywhere in the pipeline and "the tail is searchable" could not be tied
+to a real page. Third, `MinerUParser.parse` performed submit-and-poll as one indivisible call, so a
+poll timeout was reported as `parser_unavailable` — indistinguishable from "the task was never
+created". Retrying on that signal would re-submit identical bytes and re-charge provider quota,
+while not retrying would abandon a task the provider is still working on.
+
+The provider's documented per-file bounds are `≤200,000,000` bytes **and** `≤200` pages. A 313-page
+book therefore cannot be submitted as one file regardless of its byte size.
+
+### Decision
+
+1. **PDF library: `pypdf`, version verified.** `pypdf==6.19.0` (BSD-3-Clause, pure Python, no
+   native toolchain and no network at import). Verification was done against the installed package
+   rather than memory: `PdfReader`, `len(reader.pages)`, `reader.is_encrypted`, `PdfWriter.add_page`,
+   `PdfWriter.write`, and the error classes `PdfReadError` / `EmptyFileError` /
+   `FileNotDecryptedError` / `DependencyError` were inspected in the installed module, and the
+   313-page acceptance sample was read with it (313 pages, not encrypted). The pinned version is
+   recorded in `pyproject.toml` and `uv.lock`. Impact: one additional pure-Python dependency;
+   no new infrastructure.
+2. **Page counting and slicing are pure functions** (`backend/infrastructure/pdf_slicing.py`):
+   `count_pages(data)`, `slice_pages(data, first_page, last_page)`, and
+   `plan_shards(page_count, total_bytes, ...)`. They touch no network, disk, or database.
+   An encrypted PDF fails with `pdf_encrypted`, a structurally broken one with `pdf_damaged`, an
+   empty one with `empty_document`. A page count is never guessed.
+3. **Dual-limit sharding, no unbounded recursion.** Ranges are filled greedily up to
+   `MINERU_MAX_PAGES`, then any range whose (estimated or measured) byte size exceeds
+   `MINERU_MAX_BYTES` is bisected. A single page that still exceeds the byte limit fails with
+   `shard_too_large`. The bisection uses an explicit stack and its depth is bounded by
+   `log2(page_count)`; there is no recursive split without a floor. The 313-page sample therefore
+   plans `1-200` and `201-313`, and the plan is deterministic and reproducible.
+4. **A shard manifest is the execution record.** New table `ingestion_shards` (expand:
+   `CREATE TABLE IF NOT EXISTS` inside `SCHEMA_STATEMENTS`, no one-off migration script) with
+   `UNIQUE(index_version, shard_index)` and `KEY(sha256, parser_provider, parser_options)`.
+   The status machine is `pending -> running -> success | failed`. `reused` is a boolean flag on
+   `success`, deliberately **not** a fifth status, so "the manifest is closed" remains the single
+   predicate "every row is `success`".
+5. **The reuse key is `(sha256 of the shard bytes, parser_provider, parser_options)`.** A hit copies
+   the stored text into the new manifest row and marks it `reused` without calling the provider.
+   Bytes and parse profile being equal, the parse result is equal, so a successful shard is never
+   paid for twice.
+6. **Timeout is a distinct outcome, and a timeout is not "not created".** `MinerUParser` is split
+   into `submit(...) -> ProviderTask(batch_id)` (the side-effect step) and
+   `fetch(batch_id, *, deadline)` (the bounded wait); `parse()` remains as the convenience wrapper
+   so existing callers and tests are unchanged. The batch id is persisted to the manifest
+   **immediately after submit**. `fetch` raises `parse_timeout` on deadline expiry, separately from
+   `parser_unavailable` (transport/submission) and `parse_failed` (provider-declared failure).
+   On timeout the shard stays `running` with its batch id, the job fails with `parse_timeout`, and a
+   retry resumes polling the **same** batch id instead of re-submitting.
+7. **A failing shard is isolated.** Only the failed shard is re-attempted (a new `attempt`); shards
+   that already succeeded are reused. Failures are never retried to bypass a security or permission
+   boundary — this applies only to transport/parse outcomes.
+8. **Page mapping is honest and queryable.** Page ranges are 1-based closed intervals, and the
+   manifest is the authoritative page source: the document's shards expose exactly which pages each
+   provider call covered. Where no reliable page information exists (non-PDF remote files, the
+   legacy stored-text fallback, plain text), the shard records `NULL` and `ParsedDocument.pages`
+   is `0`. A page is never fabricated as `1`. Chunk-level page spans remain P3 work (structure
+   chunking), and this ADR does not claim them.
+9. **The completeness gate covers shard closure.** Before promote the ingestion path verifies: the
+   manifest row count equals the planned shard count; `shard_index` is contiguous from `0`; page
+   ranges are contiguous and cover the whole document; every shard is `success`; and the stored
+   text length equals the merged text length. A missing or unfinished shard fails the job
+   (`shard_manifest_mismatch` / `shard_incomplete` / `shard_range_gap`) and promotes nothing.
+
+### Consequences
+
+- The 313-page acceptance becomes expressible: the book is split into `1-200` and `201-313`, both
+  shards succeed, the merged text is indexed, and the head/middle/tail of the book are searchable.
+- A poll timeout no longer risks duplicate provider charges, because the batch id survives the
+  failure and the retry path is "resume", not "resubmit".
+- A single failing shard costs one shard of quota to recover, not the whole document.
+- Page numbers that appear anywhere in the pipeline are real or explicitly absent; the previous
+  hardcoded `1` is gone.
+- `document_chunks` semantics are untouched: chunk identity, roles, and ordinals are unchanged.
+  Page ranges live in the shard manifest, not in the chunk rows.
+- Costs: one new table, one new repository, one new pure-function module, and one new dependency.
+  All are additive; no existing read path changes meaning.
+
+### Change Conditions
+
+Changing the PDF library, the sharding policy (page/byte limits, bisection floor), the reuse key,
+the shard status machine, the timeout semantics (i.e. treating a timeout as "not created" or
+re-submitting automatically), the page-mapping honesty rule, or the shard-closure gate requires
+Ingestion/API review with an updated `CR-*`/`CC-*` record and Architecture Review.
+
+### Related Contracts
+
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md) (Document and Index Version lifecycle)
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md) (parser adapter boundary)
+- [AGENTS.md](AGENTS.md) (Ingestion and Data Lifecycle rules, Version Verification)
+- [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md) (`CR-INGEST-20261009-01`)
+## ADR-038
+
+### Title
+
+Structure-aware chunking from provider block output, real page mapping, a conservative token budget, and bounded parent expansion in the RAG path
+
+### Status
+
+Accepted
+
+### Context
+
+`CR-RAG-20261009-01` (P3) targets G8/G9/G10. The P0 audit recorded: `chunk_document` splits
+normalized text by blank lines and character counts, so no section path, page, block type, order,
+or content hash survives ingestion (G8); `parent_child_mapping` merely filters the retrieval
+results instead of expanding the real parent chunk, even though
+`IndexRegistry.chunks_for_context` already exists (G9); and `context_build` concatenates child
+`content` and truncates by **character** count, so the context has no token budget and no evidence
+selection (G10).
+
+P2 batch 2 left chunk-level page spans explicitly unclaimed: the shard manifest records real page
+ranges per provider call, but a chunk could not be traced to a page.
+
+A decisive fact was established before designing: MinerU's result archive contains
+`<id>_content_list.json`, a list of typed blocks. Verified on the real 35-page sample (one real
+call): 343 blocks, keys `type`, `text`, `text_level`, `bbox`, `page_idx`, `sub_type`, `img_path`,
+`code_body`, `code_caption`, `code_footnote`, `image_caption`, `image_footnote`; observed types
+`text` (225), `code` (117), `image` (1); `page_idx` spans `0-34`; `text_level` is `1`/`2` for
+headings. The archive also carries `layout.json`, `*_model.json`, `*_origin.pdf`, images, and
+`full.md`.
+
+### Decision
+
+1. **Structure comes from the provider's block output, not from heuristics on merged text.**
+   `MinerUParser` reads `content_list.json` from the bounded archive in addition to `full.md` and
+   returns normalized `DocumentBlock` records (`text`, `block_type`, `page_index`, `heading_level`,
+   `order`). The read is bounded by the same archive limits as `full.md` (entry count, total
+   uncompressed size, per-entry size, path safety). When the entry is missing, malformed, or over
+   budget, ingestion falls back to the existing text chunking and records the fallback; it never
+   invents structure.
+2. **Page numbers are absolute and derived, never fabricated.** Each shard covers
+   `[page_start, page_end]` from the manifest; a block's absolute 1-based page is
+   `shard.page_start + block.page_index`. For non-PDF remote files, or when the provider gives no
+   page index, the chunk records `NULL`. A page is never guessed as `1`. This closes the P2
+   "chunk-level page span" gap with real data.
+3. **Block types and heading levels are preserved.** `block_type` is one of
+   `paragraph | heading | table | code | image | list` (normalized from the provider's `type` /
+   `sub_type`). A heading opens a section; `section_path` is the bounded stack of enclosing
+   headings joined by ` / `, capped at a configured depth and length. Tables, code, and images keep
+   their own block type so a citation can say what kind of evidence it is.
+4. **Parents follow structure; children follow a token budget.** A parent is a section-scoped
+   group of consecutive blocks bounded by the parent token budget; a long single block is split so
+   no parent is unbounded. Children are token-budgeted windows with the configured overlap inside
+   their parent. Parent and child identity schemes are unchanged
+   (`<index_version>-p<ordinal>` / `<index_version>-c<ordinal>`), so `document_chunks` keeps its
+   existing meaning and only gains additive columns.
+5. **The token budget is a conservative estimate, not a character count and not a real
+   tokenizer.** `estimate_tokens` counts each CJK character as `1` token and each non-CJK
+   character as `1/3` of a token, then takes the ceiling, so the estimate is an over-estimate for
+   both scripts. The pipeline never equates a Chinese character with a token (the P3 requirement)
+   and never under-fills the model window silently; the consequence is deliberately conservative
+   context sizes. The estimator is bounded, monotonic, and unit-tested. If a real tokenizer for the
+   configured model becomes available offline, the estimator is the single place to replace.
+6. **Parent expansion happens in the Graph through an injected provider.** `RagWorkflow` receives a
+   narrow `ParentContextProvider` protocol implemented over
+   `IndexRegistry.chunks_for_context`. `parent_child_mapping` uses it to fetch the real parent
+   records for the hit children, deduplicates by parent chunk ID, drops parents that are not
+   `parent` role or do not belong to the same index version, and bounds the expansion count. The
+   node still does not touch the database directly and does not mutate State outside its declared
+   fields (Graph-002, Graph-004).
+7. **Context is built under a token budget with explicit evidence selection.** For each unique
+   parent, the hit children's text is always kept (that is the evidence that actually matched) and
+   the parent contributes a bounded neighborhood as background; a parent is emitted at most once.
+   Sections are added while the token budget allows; the build is bounded by both a token budget
+   and a character ceiling, and the result records whether it was truncated. A large parent can
+   therefore never displace other evidence.
+8. **Chunk metadata is additive in the schema.** `document_chunks` gains
+   `section_path`, `block_type`, `page_start`, `page_end`, `content_hash`, `token_count` through
+   the existing idempotent expand path. No existing column changes meaning; `location` remains the
+   human-readable locator. Old rows keep `NULL`/defaults and remain readable.
+
+### Consequences
+
+- A citation can name a real page and a section path instead of a synthetic `chunk-7`, and the
+  page comes from the provider's own block index rather than from a guess.
+- The context that reaches generation is bounded by tokens, contains the actual matching evidence,
+  and cannot be flooded by one oversized parent.
+- Structured chunking is available for provider-backed documents; text-only documents keep the
+  previous behavior and are explicitly recorded as a fallback rather than silently degraded.
+- Costs: one new pure-function module, one new expand migration, one new parser dependency on the
+  archive entry, one new injected protocol in the Graph composition, and six additive columns.
+- BM25/RRF/Rerank (P4) now have the block-level fields they need; this ADR does not implement them.
+
+### Change Conditions
+
+Changing the structure source, the page-derivation rule, the token estimator's calibration, the
+parent/child identity scheme, the parent-expansion ownership (i.e. letting a Graph Node read the
+database directly or adding a new Tool for it), or the context selection policy requires
+Ingestion/Graph/Tool review with updated `CR-*`/`CC-*` records and Architecture Review.
+
+### Related Contracts
+
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md) (`CC-TOOL-002`, `knowledge_search` output)
+- [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md) (`CC-GRAPH-002`, RAG subgraph)
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md) (`CC-STATE-003`, `retrieval_results` shape)
+- [AGENTS.md](AGENTS.md) (RAG rules, bounded context and evidence)
+- [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md) (`CR-RAG-20261009-01`)
+## ADR-039
+
+### Title
+
+Document Scope: a user-selected subset of the authorized document set, enforced at the request boundary and re-checked at the retrieval boundary
+
+### Status
+
+Accepted
+
+### Context
+
+Knowledge retrieval today has an implicit and maximal scope. `RunService._authorized_document_ids()`
+returns every `available` Document the user owns; `RunCreateRequest` has no scope field;
+`RagNodes.retrieval` sends only `query` and `top_k` to `knowledge_search`; and although
+`KnowledgeSearchInput.document_ids` and the tool's `scope & requested` intersection already exist,
+nothing ever sets them. Three concrete defects follow.
+
+First, **evidence cross-contamination**: a question about document A may be answered from
+document B, because both are in the same candidate pool and nothing lets the user say "only this
+one".
+
+Second, **mis-routing**: `IntentRouter` is a deterministic keyword classifier
+(`KNOWLEDGE_TERMS` / `STRUCTURED_TERMS`). A user who explicitly selects a document and asks "what
+is the approval amount limit in this document" hits `STRUCTURED_TERMS` through the word "amount"
+and is routed to the SQL path, which never looks at the selected document at all. Selecting a
+document is itself strong evidence of Knowledge intent, and the router currently ignores it.
+
+Third, **silent failure**: `KnowledgeSearchTool._authorized_documents` filters candidates to
+`status == "available"` and returns an empty successful result when the intersection is empty. A
+selected but deleted, re-indexing, or foreign document therefore looks exactly like "the document
+does not contain the answer", which is a false statement to the user.
+
+Three identifiers must stay distinct and must never be conflated:
+`authorized_document_ids` (server-computed, never from user input), `requested_document_ids`
+(user-submitted, unproven), and `document_scope` (server-validated, the value that reaches the
+Graph).
+
+### Decision
+
+1. **Document Scope is a subset of the authorized document set.** The server computes
+   `authorized_document_ids` as "Documents owned by the current user whose status is `available`".
+   The user may submit `requested_document_ids`; after server validation the value that enters the
+   Graph is `document_scope`, and `document_scope` must be a subset of `authorized_document_ids`.
+   A scope can only narrow; it can never widen.
+2. **Three names, three meanings.** `authorized_document_ids` is computed at execution time and
+   is never placed in Graph State and never returned to the frontend. `requested_document_ids` is
+   unproven input. `document_scope` is the validated execution input. Code must not use the
+   requested list as an authorization set anywhere.
+3. **The API accepts a bounded, deduplicated list.** `RunCreateRequest` gains
+   `document_ids: list[str] | None = None`: at most 20 identifiers, each at most 64 characters,
+   deduplicated before the limit is applied, preserving first-occurrence order. An empty array and
+   an absent field both mean "no scope". Paths, URLs, filenames, and arbitrary query conditions are
+   not accepted as scope. The API layer owns format validation; the Application layer owns
+   authorization validation.
+4. **Create-time fast validation, with no side effects on rejection.** In `start_run`, when a
+   non-empty `document_ids` is submitted, the server loads the current user's `available` Documents
+   and requires every requested identifier to be a member. Any failure returns
+   `409 conflict` with code `document_scope_unavailable`, and the message must not reveal whether
+   the document does not exist, belongs to another user, was deleted, is re-indexing, or is in a
+   particular version state. On rejection no Run, Checkpoint, Application Event, or dispatch is
+   created and no Embedding, Milvus, Reranker, or LLM call is made. On success the validated list is
+   written into the initial Graph State.
+5. **State carries the scope and Resume must preserve it.** `document_scope` is a request-level
+   State field owned by the request initializer, consumed by the router and the retrieval node,
+   with Run lifetime and Checkpoint persistence. `initial_state` accepts and stores it;
+   `request_initialize` must **not** reset, clear, or overwrite it, so a HITL Resume and an approval
+   successor Run inherit the scope from the Checkpoint instead of falling back to "no scope"
+   (which would silently widen retrieval). The field is bounded and deduplicated; the full
+   authorized set is never copied into State.
+6. **A′ routing: scope is a strong Knowledge signal, but only for requests that carry one.**
+   With a non-empty `document_scope`, a request that matches `KNOWLEDGE_TERMS`, `STRUCTURED_TERMS`,
+   or both is routed to `knowledge`; a request that matches neither is routed to `general`. The
+   mixed case therefore resolves through the user's own disambiguation instead of returning
+   `unsupported_mixed_query`. Without a scope the existing classification is unchanged, so
+   greetings still reach `general` and no-scope requests keep their current routing and retrieval
+   semantics exactly. `current_path` continues to follow the State Contract and stays `null` for
+   non-`routed` outcomes. No Planner, Supervisor, Query Rewrite, or free-planning Agent is added.
+7. **The retrieval boundary is the authoritative re-check.** Create-time validation is a fast
+   fail, not the security boundary. `knowledge_search` re-validates, before any provider is called:
+   whether the scope is empty; whether the user still owns the documents; whether they are still
+   `available`; whether they still have a valid active index version; whether an explicit
+   `index_version` is still active, available, and authorized; and the races between creation and
+   retrieval (deletion, re-index, version switch). The `scope & requested` intersection logic is
+   unchanged and must never become "user request overrides authorization".
+8. **An empty intersection is an explicit rejection, not an empty answer.** When a non-empty scope
+   intersects the currently available authorized set to nothing, `knowledge_search` returns a
+   normalized `rejected` Tool Result with code `document_scope_unavailable`, without calling Dense
+   embedding, BM25, Milvus, Reranker, or the LLM; the Graph maps it through the existing safe
+   failure path; and the user-visible message is explicit but does not reveal the reason. It is
+   never presented as "the document does not contain the answer".
+
+   The same rejection applies when a selected Document has no usable active index version. That
+   case is caught at the **retrieval boundary**, not at create time: create time checks membership
+   in the available set only (decision 4), because a Document whose new version is still indexing
+   legitimately keeps serving its previous active version. The candidate-version scan therefore
+   runs **before** the embedding call, so this rejection path also makes zero provider calls.
+   Which boundary catches which case is deliberate and recorded here: a foreign, deleted, or
+   unknown identifier is refused at create time with `409`; a Document that lost its active version
+   after the Run was created is refused at retrieval with the same code inside the stream.
+9. **Parent expansion, citations, and caches stay inside the scope.** Any Child, Parent, or
+   Evidence whose document identifier is not in the effective scope, or whose index version is not
+   the authorized active version, must be dropped. The existing parent-context provider already
+   filters by index version and role; scope filtering is added to the same boundary.
+10. **The scope is not persisted on the Run row.** It is an execution input carried by Graph State
+    and Checkpoint; adding a column would create a second source of truth with no read path. The
+    Run row, API responses, SSE payloads, and logs never expose the scope contents beyond what the
+    client itself submitted.
+11. **The guarantee is bounded, and stated honestly.** The system guarantees that unauthorized,
+    deleted, re-indexing, or non-active-version content never reaches a provider or the final
+    context, because every boundary re-validates and fails safe. It does **not** guarantee that an
+    old version cannot change during one question, since there is no database-level strong
+    consistency snapshot across the request lifetime.
+12. **Scope enforcement precedes the retrieval stages that exist today.** The V1 target chain is
+    `Dense + Chinese BM25 -> RRF -> BGE Rerank`; BM25, RRF, and Rerank are `CR-RAG` P4 work and are
+    **not implemented**. What is implemented is the scope resolution and the intersection check,
+    which happen before the embedding call. P4's stages run after that point and therefore inherit
+    the enforcement by construction. This ADR does not claim that BM25, RRF, or Rerank exist.
+
+### Consequences
+
+- A user can ask about one document and get evidence only from it; a question whose wording
+  contains business-data keywords is no longer taken away from an explicitly selected document.
+- Selecting an unavailable or foreign document produces an explicit, non-leaking conflict instead
+  of a silent empty answer that reads as "not in the document".
+- Greetings keep working with a scope selected, because the A′ rule only overrides the
+  knowledge/structured decision, not the "neither" decision.
+- No-scope requests are behaviorally unchanged, so the existing suite remains the regression net.
+- The scope survives HITL Interrupt/Resume and approval successors through the Checkpoint, which
+  closes the failure mode where a resumed run would silently widen back to the whole corpus.
+- Costs: one request field, one State field, one error code, one router parameter, one tool branch,
+  and contract updates across Terminology, State, Tool, Graph, and API.
+- The recorded guarantee is weaker than "stable snapshot for the duration of a question"; every
+  boundary re-validates and fails safe instead.
+
+### Change Conditions
+
+Changing the definition of the authorized set, the subset rule, the rejection code or status,
+the A′ routing table, the requirement that `request_initialize` preserve the scope, the
+authoritative re-check at the retrieval boundary, the "empty intersection is a rejection" rule, or
+the decision not to persist the scope on the Run row requires API/State/Tool/Graph review with
+updated `CR-*`/`CC-*` records and Architecture Review.
+
+### Related Contracts
+
+- [TERMINOLOGY.md](docs/contracts/TERMINOLOGY.md) (TERM-044/045/046)
+- [STATE_CONTRACT.md](docs/contracts/STATE_CONTRACT.md) (`CC-STATE-004`)
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md) (`CC-TOOL-003`)
+- [GRAPH_CONTRACT.md](docs/contracts/GRAPH_CONTRACT.md) (`CC-GRAPH-003`)
+- [API_CONTRACT.md](docs/contracts/API_CONTRACT.md) (`CC-API-002`)
+- [AGENTS.md](AGENTS.md) (RAG and authorization rules)
+- [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md) (`CR-RAG-20261009-01`)
+## ADR-040
+
+### Title
+
+Document lifecycle: a Document is `indexing` until a version is promoted, and a duplicate upload reports the real state
+
+### Status
+
+Accepted
+
+### Context
+
+`CR-INGEST-20261009-01` batch 1 established that the original file and the Ingestion Job are persisted before scheduling, so a failed parse is retryable. Two defects remained open in the P0 matrix (G19, G20) and were re-confirmed during the P2/P3 acceptance runs.
+
+**G19 — a Document is `available` before it is usable.** `DocumentRepository.create` inserts
+`status = 'available'` at upload time, while `active_index_version` stays `NULL` until a version is
+promoted. `available` therefore means two different things: "the user uploaded it" and "it has a
+valid active index version". Consequences: the document list shows a broken document as available;
+the Document Scope picker offers it; `IndexRegistry.resolve_active_version` silently returns
+`None`; and if ingestion fails, the Document stays `available` with no active version forever. This
+was observed directly: a 313-page document left over from the P0 audit sits at
+`status=available` with `active_index_version=NULL`, and it is offered in the scope picker while
+being unretrievable.
+
+**G20 — a duplicate upload always reports success.** `submit_upload`'s dedup branch returns
+`UploadOutcome(..., ingestion_job_id="", index_version=<active or "">, status="success", duplicate=True)`
+with the status hardcoded. A client re-uploading content whose Job is `pending`, `running`, or
+`failed` is told `success`, so it cannot tell "already indexed" from "still indexing" from
+"indexing failed". Combined with G19 this is unrecoverable through the API: re-uploading the broken
+313-page document returns `success`, and `reindex` refuses with `409` because there is no stored
+content to re-index, so the only escape is to delete and re-upload.
+
+### Decision
+
+1. **A Document is created as `indexing`.** `available` is reserved for a Document that has a valid
+   active index version and can be retrieved. `documents.status` therefore has four values:
+   `indexing`, `available`, `failed`, `deleted`.
+2. **Promotion is the single transition into `available`.** `IndexRegistry.promote` sets the active
+   version and the `available` status in **one conditional UPDATE** that refuses `deleted`
+   documents, so a deleted Document can never be reactivated and the two facts cannot diverge. The
+   previous "is the document available?" precondition is replaced by the conditional update itself,
+   because requiring `available` before promoting would deadlock the new lifecycle.
+3. **A failed ingestion marks the Document `failed`, but only when it has no active version.** A
+   failed re-index must not degrade a Document that is still serving its previous version, so the
+   update is guarded by `active_index_version IS NULL`. The same guard is applied by stale-running
+   and orphaned-pending recovery, so a Job that dies without a failure record still leaves an
+   honest Document state instead of a permanent `indexing`.
+4. **A duplicate upload reports the real state.** The dedup branch returns the latest Job's
+   `status` and `ingestion_job_id` when a Job exists, and otherwise falls back to
+   `success`/`failed` based on whether the Document actually has an active version. It never
+   reports `success` for a Document that is not indexed, and it does not schedule anything (the
+   duplicate path still does not dispatch).
+5. **Deletion stays available for every non-deleted Document.** `submit_delete` accepts
+   `indexing` and `failed` as well as `available`, so a stuck or broken Document can always be
+   removed. `deleted` remains terminal.
+6. **Retrieval predicates do not change meaning.** Only `available` Documents are members of the
+   Authorized Document Set, so an `indexing` or `failed` Document cannot be retrieved, cannot be
+   selected as a Document Scope, and cannot become an evidence source. Re-index still requires an
+   `available` Document, because it needs existing stored content.
+7. **No data migration is performed for legacy rows.** A Document that is `available` without an
+   active version can exist from before this change. Backfilling would have to guess whether it is
+   indexing, failed, or deliberately empty, so instead: it is not retrievable and not selectable
+   (unchanged), a duplicate upload now reports `failed` for it, and it can be deleted. This legacy
+   state is recorded as a known condition rather than silently rewritten.
+8. **Document status is application-owned business data, not Graph State.** No State field, no
+   Checkpoint format, and no Graph topology changes. The status is a Conversation/Application
+   persistence fact that the API exposes and the retrieval boundary reads.
+
+### Consequences
+
+- The document list, the scope picker, and the retrieval boundary now agree on what "usable" means;
+  a broken document can no longer be presented as available or selected for retrieval.
+- A client re-uploading content learns the truth (pending / running / failed / success) instead of
+  a hardcoded `success`, which makes the failure recoverable through the API.
+- A failed ingestion no longer leaves a Document permanently `indexing`; a failed **re-index**
+  still leaves the working version untouched.
+- Deleting a stuck Document is always possible, which removes the need for the manual purge path
+  that the P3 acceptance script had to add.
+- Costs: one new status vocabulary, one new repository method for the atomic activation, one for
+  the guarded failure marking, and updated predicates in promotion and deletion.
+- Risk accepted: a legacy `available`-without-version row is not repaired automatically. It is
+  inert (not retrievable, not selectable) and deletable.
+
+### Change Conditions
+
+Changing the status vocabulary, the single-transition rule for `available`, the guard on
+failure marking (`active_index_version IS NULL`), the duplicate-upload response semantics, or the
+deletion predicate requires Ingestion/API review with updated `CR-*`/`CC-*` records and
+Architecture Review.
+
+### Related Contracts
+
+- [API_CONTRACT.md](docs/contracts/API_CONTRACT.md) (`CC-API-003`)
+- [TOOL_CONTRACT.md](docs/contracts/TOOL_CONTRACT.md) (`CC-TOOL-003`, Authorized Document Set)
+- [AGENTS.md](AGENTS.md) (Ingestion and Data Lifecycle rules)
+- [POST_MVP_CHANGE_RECORDS.md](docs/POST_MVP_CHANGE_RECORDS.md) (`CR-INGEST-20261009-01`)
+
+## ADR-041: Deterministic compatibility failures and versioned hybrid retrieval
+
+Status: Accepted for implementation under CR-RAG-20261009-01 (2026-10-10).
+
+Architecture review: preserve Tool Registry, active-version authority, request authorization,
+Graph topology, HITL and bounded context. No State, HTTP endpoint or SQL permission change.
+`knowledge_index_incompatible` is a non-recoverable Tool/Graph failure; accepted Runs report it
+through their existing terminal events, never a new HTTP status after acceptance.
+
+New ingestion uses a profile-derived `_hybrid_v1` collection. Complete child text (maximum 65535
+UTF-8 bytes, fail explicitly above it) feeds native BM25 with the Chinese analyzer. The preview
+remains independently truncated. Legacy Dense collections remain readable through registry metadata.
+Re-index is the controlled migration; failure retains the previous serving version. Rollback of
+retrieval disables rerank and uses Dense reads; no volume or legacy collection is deleted.
+
+Dense and sparse are queried with the same registry-derived active version filter. Dense ranks
+are global within the compatible embedding space. BM25 ranks are used only from one compatible
+hybrid collection and its entire authorized version set, never compared across collections.
+RRF k=60; missing rank contributes zero. Candidate window <=200, rerank input <=50, output <=50.
+Rerank references the Embedding URL/Secret directly. Invalid, duplicate, non-finite or missing
+rerank results fall back to retained bounded candidates with explicit degradation metadata.
+Returned chunk identities and active versions are checked again before content reaches rerank.
+
+Validation: unit boundary tests plus an isolated real Milvus collection and actual rerank request;
+quality claims require the separate fixed evaluation and are not implied by this review.
+# ADR-042: Evidence-aware validation and authoritative final citations
+
+Status: Accepted for the authorized V1 RAG implementation.
+
+Context: Truncation retained unused sources and a single token/label could pass grounding;
+exhausted revisions could still publish an invalid candidate.
+Decision: Keep graph topology and budgets. Select children before background, retain exact
+excerpts, screen claims deterministically and use bounded evidence-only remote adjudication.
+Fail closed on invalid judge output; commit only validated sources. Final SSE adds citations
+and safe error/validation codes. No provider SDK enters State or Application.
+Impact: CC-GRAPH-004, CC-STATE-005, CC-API-005; focused regression and live quality evaluation.
+Rollback: Restore the prior validation implementation only together with its contracts;
+retrieval can be configured Dense independently, but unsafe validation is not a release option.
+
+
+## ADR-043：修正分页 cursor 的 UTC 语义
+
+日期：2026-10-11。状态：Reviewed（用户授权继续修复阶段一已复现阻断项）。
+关联：CR-PAGINATION-20261011-01、CC-API-006、API-012/014。
+
+### 背景与问题
+
+历史审计 RUN_LIFECYCLE_REPAIR_SUMMARY §8 的 P1 分页时区项，在本机 UTC+8
+环境已复现：数据库朴素 UTC 值直接调用 datetime.timestamp()，生成值偏移 8 小时。
+Conversations/Messages 解码按 UTC；Documents 的 FROM_UNIXTIME() 还依赖 MySQL
+session 时区。浮点转换也不适合严格保持 DATETIME(6) 的微秒边界。
+
+### 架构评审与决定
+
+这是现有 API-012 不透明 cursor 的实现纠错，不引入接口字段、State、Graph、数据库
+列、依赖或新的分页架构。复用 domain.identifiers 的时间辅助边界，提供统一 UTC
+整数微秒编码/解码：朴素输入附加 UTC，aware 输入先转换 UTC；解码返回朴素 UTC。
+Conversations、Messages、Documents 使用同一规则；Documents 查询绑定 datetime，
+不使用 FROM_UNIXTIME()，从而不依赖 session 时区。
+
+### 影响与兼容
+
+保留不透明十进制微秒字符串、列表排序、上限及资源授权语义。不修改业务数据。
+旧非 UTC 主机发出的错误 cursor 无法无歧义地区分，不回填或自动补偿；升级后客户端
+应从第一页重新获取 cursor。客户端已有重取列表入口，无需新增前端协议。
+本轮只修复时区/精度，不扩展为复合 cursor。同一 created_at 的多个记录原有分页
+tie-break 缺口须单独登记，不能将本轮结果称作所有分页行为已经验收。
+
+### 验证与回滚
+
+tests/unit/test_pagination_cursor.py 覆盖三个生产仓储入口连续翻页、UTC-5/UTC/UTC+8
+确定性时间替身、微秒边界及 aware UTC 转换。旧仓储源码隔离进程复现 7 failed/9 passed；
+修复后的 focused 27 passed，最终回归结果见本批报告，不以代码存在替代验收。
+补充验证：专用隔离 MySQL 三个 session 时区、三个列表入口共 9 passed，项目资源已清理。
+未执行用户数据迁移或恢复演练，HTTP 完整分页与阶段一其他门禁仍需独立核销。回滚时仅还原本批 cursor 增量及相应登记，
+保留本轮之前 documents.py 的用户未提交内容；回滚会重新引入时区问题，仍 NO-GO。

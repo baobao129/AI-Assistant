@@ -140,7 +140,7 @@ def test_repair_budget_is_respected_and_failure_becomes_terminal():
     assert tool.calls == 2, "one initial attempt plus one repair attempt"
     assert result["error"]["code"] == "retrieval_unavailable"
     assert result["error"]["repair_attempts"] == 1
-    assert "temporarily unavailable" in result["final_response"]
+    assert "暂时不可用" in result["final_response"]
 
 
 def test_zero_repair_budget_does_not_retry():
@@ -171,7 +171,27 @@ def test_general_path_llm_failure_beyond_budget_is_terminal_and_safe():
     result = _run("say hello", llm=llm, budgets=ExecutionBudgets(max_repair_attempts=1))
     assert llm.calls == 2
     assert result["error"]["code"] == "llm_unavailable"
-    assert "language model is unavailable" in result["final_response"]
+    assert "语言模型暂时不可用" in result["final_response"]
+
+
+def test_incompatible_index_never_repairs_or_generates():
+    class Incompatible(FlakyKnowledgeTool):
+        def execute(self, tool_call_id, arguments, context=None):
+            self.calls += 1
+            return ToolResult(
+                tool_id="knowledge_search",
+                tool_call_id=tool_call_id,
+                status="failed",
+                error=ToolError(code="knowledge_index_incompatible", message="unavailable"),
+            )
+
+    tool = Incompatible(failures=0)
+    llm = FlakyLLM(failures=0)
+    result = _run("policy document question", tool=tool, llm=llm)
+    assert tool.calls == 1 and llm.calls == 0
+    assert repair_count(result) == 0
+    assert result["error"]["code"] == "knowledge_index_incompatible"
+    assert "不兼容" in result["final_response"]
 
 
 def test_tool_rejection_is_never_repaired():

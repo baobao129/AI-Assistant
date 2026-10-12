@@ -3,6 +3,10 @@
  * 浏览器绝不直接调用 Tool，也绝不发送原始 SQL。
  */
 
+import { runRequestBody } from './scope.js'
+import { errorMessage } from './labels.js'
+import { reactive } from 'vue'
+
 // 会话令牌与用户信息持久化在 localStorage 中，刷新页面后仍可恢复登录态。
 const TOKEN_KEY = 'dsh.session.token'
 const USER_KEY = 'dsh.session.user'
@@ -16,7 +20,7 @@ export class ApiError extends Error {
   }
 }
 
-export const session = {
+export const session = reactive({
   token: localStorage.getItem(TOKEN_KEY) || '',
   user: JSON.parse(localStorage.getItem(USER_KEY) || 'null'),
   save(token, user) {
@@ -34,7 +38,7 @@ export const session = {
   get authenticated() {
     return Boolean(this.token)
   },
-}
+})
 
 // 已登录时统一附加 Authorization: Bearer 头；未登录则原样透传调用方提供的额外头。
 export function authHeaders(extra = {}) {
@@ -70,7 +74,7 @@ export async function request(path, { method = 'GET', body, form, signal } = {})
     throw new ApiError(
       response.status,
       error.code || 'internal_error',
-      error.message || 'The request could not be completed.',
+      errorMessage(error),
       response.headers.get('X-Request-ID') || error.request_id,
     )
   }
@@ -92,10 +96,12 @@ export const api = {
     request(`/api/v1/conversations/${id}/messages?limit=${limit}`),
   deleteConversation: (id) => request(`/api/v1/conversations/${id}`, { method: 'DELETE' }),
 
-  createRun: (conversationId, userInput, threadId = null) =>
+  // 文档作用域（ADR-039）：documentIds 为空时不发送 document_ids 字段，
+  // 与「缺省」完全等价，保持无作用域请求的既有行为。
+  createRun: (conversationId, userInput, threadId = null, documentIds = []) =>
     request(`/api/v1/conversations/${conversationId}/runs`, {
       method: 'POST',
-      body: { user_input: userInput, thread_id: threadId, client_metadata: {} },
+      body: runRequestBody(userInput, threadId, documentIds),
     }),
   getRun: (runId) => request(`/api/v1/runs/${runId}`),
 

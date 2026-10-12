@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from backend.application.index_registry import IndexRegistry
+from backend.application.index_registry import IndexRegistry, RegistryParentContext
 from backend.application.ingestion import IngestionService
 from backend.infrastructure.config import Settings
 from backend.infrastructure.database import (
@@ -37,11 +37,13 @@ from backend.infrastructure.repositories.documents import (
     DocumentRepository,
     IndexVersionRepository,
     IngestionJobRepository,
+    IngestionShardRepository,
 )
 from backend.infrastructure.repositories.structured import (
     ExportArtifactRepository,
     QueryResultRepository,
 )
+from backend.infrastructure.reranker import Reranker, create_reranker
 from backend.infrastructure.schema import initialize_read_only_account, initialize_schema
 from backend.infrastructure.vector_store import VectorStore, create_vector_store
 from backend.tools.sql_validator import ProjectSQLValidator, build_validator
@@ -67,14 +69,18 @@ class Runtime:
     versions: IndexVersionRepository
     chunks: ChunkRepository
     jobs: IngestionJobRepository
+    shards: IngestionShardRepository
     query_results: QueryResultRepository
     artifacts: ExportArtifactRepository
     validator: ProjectSQLValidator
     query_runner: ReadOnlyQueryRunner
     embeddings: EmbeddingProvider
     vectors: VectorStore
+    reranker: Reranker
     parser: DocumentParser
     registry: IndexRegistry
+    # Graph 侧的父块提供者（ADR-038 决策 6）：有界、去重、按 index version 与角色过滤。
+    parent_context: RegistryParentContext
     ingestion: IngestionService
     _worker_slots: threading.BoundedSemaphore
 
@@ -122,6 +128,7 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
     versions = IndexVersionRepository(application_pool)
     chunks = ChunkRepository(application_pool)
     jobs = IngestionJobRepository(application_pool)
+    shards = IngestionShardRepository(application_pool)
     query_results = QueryResultRepository(application_pool)
     artifacts = ExportArtifactRepository(application_pool)
 
@@ -133,8 +140,12 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
     )
     embeddings = create_embedding_provider(settings)
     vectors = create_vector_store(settings)
+    reranker = create_reranker(settings)
     parser = create_parser(settings)
     registry = IndexRegistry(documents=documents, versions=versions, chunks=chunks)
+    parent_context = RegistryParentContext(
+        registry=registry, max_parents=settings.max_parent_expansion
+    )
     ingestion = IngestionService(
         settings=settings,
         documents=documents,
@@ -144,6 +155,7 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
         versions=versions,
         chunks=chunks,
         jobs=jobs,
+        shards=shards,
         registry=registry,
         parser=parser,
         embeddings=embeddings,
@@ -166,14 +178,17 @@ def build_runtime(settings: Settings, *, initialize: bool = True) -> Runtime:
         versions=versions,
         chunks=chunks,
         jobs=jobs,
+        shards=shards,
         query_results=query_results,
         artifacts=artifacts,
         validator=validator,
         query_runner=query_runner,
         embeddings=embeddings,
         vectors=vectors,
+        reranker=reranker,
         parser=parser,
         registry=registry,
+        parent_context=parent_context,
         ingestion=ingestion,
         _worker_slots=threading.BoundedSemaphore(max(1, settings.mysql_pool_size)),
     )

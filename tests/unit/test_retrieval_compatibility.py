@@ -4,7 +4,7 @@
 （切换真实向量后必然出现：真实 BGE-M3 为 1024 维，历史离线验收语料为 64 维）。
 查询向量只能检索 embedding 元数据兼容的 version；不兼容的 version 必须在执行任何
 vector search **之前**被跳过，而不是靠捕获 Milvus 维度错误来掩盖问题。
-全部候选版本都不兼容时才安全失败（`retrieval_unavailable`）。
+全部候选版本都不兼容时才安全失败（`knowledge_index_incompatible`）。
 
 因此本文件的断言既检查最终 Tool Result，也通过 RecordingVectorStore 检查
 「不兼容的 index version / collection 从未真正触发向量检索」。
@@ -47,6 +47,80 @@ class FakeEmbeddingProvider:
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [self.embed(text) for text in texts]
+
+
+def test_hybrid_keeps_sparse_only_candidates_and_excludes_foreign_content():
+    versions = [
+        _version(doc, provider=REAL_PROVIDER, model=REAL_MODEL, dimension=REAL_DIMENSION)
+        for doc in ("a", "b")
+    ]
+    scenario = _scenario(versions=versions)
+
+    class Scoped:
+        def search_scope(self, *, sparse=False, **kwargs):
+            assert set(kwargs["versions"]) == {"v-a", "v-b"}
+            if sparse:
+                return [_match("b", "v-b"), _match("foreign", "v-foreign")]
+            return [_match("a", "v-a")]
+
+    class Rerank:
+        def rerank(self, query, documents, *, top_n):
+            assert len(documents) == 2
+            return [(1, 0.9), (0, 0.1)]
+
+    scenario.tool.vectors = Scoped()
+    scenario.tool.reranker = Rerank()
+    result = scenario.search(top_k=2)
+    assert result.status == "success"
+    hits = result.data["results"]
+    assert [hit["document_id"] for hit in hits] == ["b", "a"]
+    assert hits[0]["scores"]["rrf_score"] == round(1 / 61, 6)
+    assert "dense_score" not in hits[0]["scores"]
+    assert hits[0]["retrieval_mode"] == "hybrid_rerank"
+
+
+def test_rerank_failure_preserves_global_fusion_order():
+    from backend.infrastructure.reranker import RerankerError
+
+    versions = [
+        _version(doc, provider=REAL_PROVIDER, model=REAL_MODEL, dimension=REAL_DIMENSION)
+        for doc in ("a", "b")
+    ]
+    scenario = _scenario(versions=versions)
+
+    class Scoped:
+        def search_scope(self, *, sparse=False, **kwargs):
+            return [_match("b", "v-b")] if sparse else [_match("a", "v-a"), _match("b", "v-b")]
+
+    class Broken:
+        def rerank(self, *args, **kwargs):
+            raise RerankerError("unavailable")
+
+    scenario.tool.vectors = Scoped()
+    scenario.tool.reranker = Broken()
+    hits = scenario.search(top_k=2).data["results"]
+    assert [hit["document_id"] for hit in hits] == ["b", "a"]
+    assert all(hit["rerank_degraded"] for hit in hits)
+
+
+def test_dense_mode_never_calls_sparse_or_rerank_and_retains_cosine():
+    versions = [_version("a", provider=REAL_PROVIDER, model=REAL_MODEL, dimension=REAL_DIMENSION)]
+    scenario = _scenario(versions=versions)
+    scenario.tool.settings = Settings(_env_file=None, retrieval_mode="dense")
+
+    class Scoped:
+        def search_scope(self, *, sparse=False, **kwargs):
+            assert not sparse
+            return [_match("a", "v-a")]
+
+    class Forbidden:
+        def rerank(self, *args, **kwargs):
+            raise AssertionError("disabled mode rerank")
+
+    scenario.tool.vectors = Scoped()
+    scenario.tool.reranker = Forbidden()
+    hit = scenario.search().data["results"][0]
+    assert hit["score"] == 0.92 and hit["retrieval_mode"] == "dense"
 
 
 class RecordingVectorStore:
@@ -330,7 +404,7 @@ def test_same_dimension_with_different_provider_or_model_is_skipped():
 
 
 def test_all_candidates_incompatible_returns_safe_failure_without_search():
-    # C. 所有候选版本均不兼容：安全失败为 retrieval_unavailable，且没有触发任何检索。
+    # C. 所有候选版本均不兼容：确定性安全失败，且没有触发任何检索。
     legacy = _version(
         "doc-legacy",
         provider=LEGACY_PROVIDER,
@@ -342,7 +416,7 @@ def test_all_candidates_incompatible_returns_safe_failure_without_search():
     result = scenario.search()
 
     assert result.status == "failed"
-    assert result.error is not None and result.error.code == "retrieval_unavailable"
+    assert result.error is not None and result.error.code == "knowledge_index_incompatible"
     assert scenario.vectors.searches == []
 
 
@@ -386,7 +460,7 @@ def test_explicit_incompatible_index_version_fails_safely():
     result = scenario.search(index_version=legacy.index_version)
 
     assert result.status == "failed"
-    assert result.error is not None and result.error.code == "retrieval_unavailable"
+    assert result.error is not None and result.error.code == "knowledge_index_incompatible"
     assert scenario.vectors.searches == []
 
 

@@ -3,10 +3,19 @@
 Internal knowledge and business-data question answering. Canonical behavior remains in
 `docs/contracts/` (local development material, not committed).
 
+中文项目总览、当前阶段和后续步骤见 [`docs/项目总览.md`](docs/项目总览.md)；可视化流程见
+[`docs/项目流程图.html`](docs/项目流程图.html)。
+
 Implemented: infrastructure, the main LangGraph (Knowledge, Structured Data, General, and
 safe routing paths), capability-aware LLM adapters, the layered SQL security boundary, the
 RAG ingestion/retrieval chain, Checkpoint-backed HITL export approval, authentication, the
 Conversation/Run/Document/Ingestion/Structured Data APIs, SSE streaming, and the Vue3 UI.
+
+V1 retrieval now uses Chinese BM25 + Dense, global RRF and bounded BGE reranking, followed by
+authorized Parent/Child context and evidence validation. Newly migrated versions use the hybrid
+schema; legacy indexes remain Dense-only until explicit owned-document migration. The UI is
+Chinese. Remote answers emit provisional visible content deltas and are replaced by the validated
+final. Cancellation is formally deferred in `docs/G21_DEFERRAL.md`.
 
 ## Windows startup
 

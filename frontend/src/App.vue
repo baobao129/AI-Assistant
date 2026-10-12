@@ -10,9 +10,9 @@ const busy = ref(false)
 
 const user = computed(() => session.user)
 const navigation = computed(() => [
-  { name: 'dashboard', label: 'Dashboard', icon: ShieldCheck },
-  { name: 'chat', label: 'Chat', icon: MessagesSquare },
-  { name: 'data', label: 'Data', icon: Database },
+  { name: 'dashboard', label: '系统状态', icon: ShieldCheck },
+  { name: 'chat', label: '对话', icon: MessagesSquare },
+  { name: 'data', label: '文档与数据', icon: Database },
 ])
 
 async function signOut() {
@@ -32,8 +32,8 @@ async function signOut() {
 <template>
   <header class="topbar">
     <Activity aria-hidden="true" :size="24" />
-    <span>Enterprise Multi-Source AI Agent</span>
-    <nav v-if="session.authenticated" class="main-nav" aria-label="Primary">
+    <span>企业多源智能助手</span>
+    <nav v-if="session.authenticated" class="main-nav" aria-label="主导航">
       <RouterLink
         v-for="item in navigation"
         :key="item.name"
@@ -50,8 +50,8 @@ async function signOut() {
       <button
         v-if="session.authenticated"
         class="icon-button"
-        title="Sign out"
-        aria-label="Sign out"
+        title="退出登录"
+        aria-label="退出登录"
         :disabled="busy"
         @click="signOut"
       >
@@ -62,5 +62,5 @@ async function signOut() {
   <main :class="{ wide: route.name === 'chat' || route.name === 'data' }">
     <RouterView />
   </main>
-  <footer>Enterprise Multi-Source AI Agent <span>Internal MVP</span></footer>
+  <footer>企业多源智能助手 <span>内部工作台</span></footer>
 </template>

@@ -12,6 +12,7 @@ Conversation Persistence、Run 状态与 Application Events。
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,9 +23,15 @@ from backend.application.terminal import (
     apply_terminal_transition,
     record_terminal_transition,
 )
-from backend.domain.errors import AppError, ExecutionOwnershipLost, conflict, not_found
+from backend.domain.errors import (
+    AppError,
+    ExecutionOwnershipLost,
+    conflict,
+    document_scope_unavailable,
+    not_found,
+)
 from backend.domain.identifiers import new_id
-from backend.domain.state import initial_state
+from backend.domain.state import bounded_document_scope, initial_state
 from backend.graph.main import build_main_graph
 from backend.infrastructure.config import Settings
 from backend.infrastructure.database import MySQLConnectionPool
@@ -51,6 +58,9 @@ class RunHandle:
     thread_id: str
     run_id: str
     status: str
+    # 服务端校验后的文档作用域（ADR-039）。**内部字段**：只用于把已校验的值从
+    # ``start_run`` 传到调度器，绝不进入 API 响应或日志。
+    document_scope: tuple[str, ...] = ()
 
 
 class RunService:
@@ -67,6 +77,7 @@ class RunService:
         checkpointer: object | None,
         tool_executor: Any,
         pool: MySQLConnectionPool,
+        parent_context: Any = None,
     ) -> None:
         self.settings = settings
         self.conversations = conversations
@@ -77,6 +88,8 @@ class RunService:
         self.events = events
         self.checkpointer = checkpointer
         self.tool_executor = tool_executor
+        # 父块提供者（ADR-038 决策 6）：Graph 用它展开真实父块，未装配时退化为直通。
+        self.parent_context = parent_context
         # 终态转换的事务边界：状态与终态事件必须同一事务提交（application.terminal）。
         self.pool = pool
 
@@ -89,6 +102,7 @@ class RunService:
         user_input: str,
         thread_id: str | None,
         client_metadata: dict[str, Any] | None = None,
+        document_ids: Sequence[str] | None = None,
     ) -> RunHandle:
         conversation = self.conversations.get(conversation_id, user_id=user_id)
         if conversation is None:
@@ -96,6 +110,9 @@ class RunService:
         text = user_input.strip()
         if not text:
             raise AppError("validation_error", "A request is required.", status_code=422)
+        # 作用域校验必须发生在**任何副作用之前**（ADR-039 决策 4）：拒绝时不创建
+        # Thread、消息、Run、Checkpoint 或事件，也不 dispatch、不调用任何 provider。
+        document_scope = self._validated_document_scope(user_id=user_id, requested=document_ids)
         if thread_id:
             if not self.threads.belongs_to_conversation(
                 thread_id=thread_id, conversation_id=conversation_id
@@ -121,7 +138,26 @@ class RunService:
             client_metadata=client_metadata,
         )
         self.conversations.touch(conversation_id)
-        return RunHandle(conversation_id, thread_id, run.run_id, run.status)
+        return RunHandle(conversation_id, thread_id, run.run_id, run.status, tuple(document_scope))
+
+    def _validated_document_scope(
+        self, *, user_id: str, requested: Sequence[str] | None
+    ) -> tuple[str, ...]:
+        """把请求作用域校验为**授权集合的子集**（ADR-039 决策 4 / CC-API-002）。
+
+        授权集合由服务端即时计算（该用户 available 文档），绝不接受客户端提交。
+        任一请求 ID 不在其中时返回统一的 ``document_scope_unavailable``：未授权、
+        已删除、不存在与版本状态异常共享同一个码与文案，因此不泄漏他人文档是否存在。
+        未提交或空数组 = 无作用域，保持既有行为。
+        """
+
+        bounded = bounded_document_scope(requested)
+        if not bounded:
+            return ()
+        authorized = set(self._authorized_document_ids(user_id))
+        if any(document_id not in authorized for document_id in bounded):
+            raise document_scope_unavailable()
+        return tuple(bounded)
 
     def resolve_run(self, *, user_id: str, run_id: str) -> RunRecord:
         run = self.runs.get(run_id)
@@ -130,7 +166,13 @@ class RunService:
         return run
 
     # 执行 -------------------------------------------------------------
-    def execute(self, run_id: str, *, owner_token: str | None = None) -> str:
+    def execute(
+        self,
+        run_id: str,
+        *,
+        owner_token: str | None = None,
+        document_scope: Sequence[str] | None = None,
+    ) -> str:
         """领取并执行一个 Run。
 
         ``owner_token`` 由调度器在派发时生成并保留，使调度器的异常兜底也能带所有权
@@ -152,6 +194,8 @@ class RunService:
             thread_id=run.thread_id,
             run_id=run.run_id,
             user_input=run.user_input,
+            # 作用域由 ``start_run`` 校验后经调度器传入；未传入即无作用域。
+            document_scope=document_scope,
         )
         return self._run_graph(run=run, state=state, approval_request_id=None, owner_token=token)
 
@@ -252,6 +296,7 @@ class RunService:
             settings=self.settings,
             general_llm=create_llm_provider(self.settings),
             context=context,
+            parents=self.parent_context,
         )
         config = {"configurable": {"thread_id": run.thread_id}}
         # 独立租约心跳（ADR-035）：不依赖 Graph 快照或模型输出，单步长阻塞也在覆盖范围内。
@@ -322,9 +367,23 @@ class RunService:
         baseline_ready = False
         # 以增量游标（seen_*）把执行中不断增长的 State 集合映射为一次性事件，
         # 避免同一个 Tool Call、Tool Result 或 Citation 被重复发布。
-        for snapshot in graph.stream(state, config, stream_mode="values"):
+        for mode, snapshot in graph.stream(state, config, stream_mode=["values", "custom"]):
             if heartbeat.lost or not self.runs.is_owned_by(run.run_id, owner_token=owner_token):
                 raise ExecutionOwnershipLost(run.run_id)
+            if mode == "custom":
+                if isinstance(snapshot, dict) and snapshot.get("type") == "answer_delta":
+                    self.events.publish(
+                        run_id=run.run_id,
+                        thread_id=run.thread_id,
+                        event_type="token",
+                        payload={
+                            "delta": str(snapshot.get("delta") or "")[:20000],
+                            "reset": snapshot.get("reset") is True,
+                            "provisional": True,
+                        },
+                        owner_token=owner_token,
+                    )
+                continue
             latest = snapshot
             calls = [call for call in (snapshot.get("messages") or []) if call.get("tool_calls")]
             tool_results = snapshot.get("tool_results") or []
@@ -387,7 +446,11 @@ class RunService:
                     owner_token=owner_token,
                 )
             seen_results = len(tool_results)
-            citations = snapshot.get("citations") or []
+            citations = (
+                snapshot.get("citations") or []
+                if (snapshot.get("answer_validation") or {}).get("status") == "validated"
+                else []
+            )
             for citation in citations[seen_citations:]:
                 self.events.publish(
                     run_id=run.run_id,
@@ -490,7 +553,13 @@ class RunService:
                     thread_id=run.thread_id,
                     status=terminal_status,
                     event_type="final",
-                    payload={"status": terminal_status, "content": final_response},
+                    payload={
+                        "status": terminal_status,
+                        "content": final_response,
+                        "citations": state.get("citations") or [],
+                        "error_code": error.get("code"),
+                        "validation_status": validation.get("status"),
+                    },
                     logical_transition=f"final:{terminal_status}",
                     required_status="running",
                     required_owner=owner_token,

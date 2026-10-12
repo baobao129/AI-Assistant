@@ -28,7 +28,8 @@ def test_live_runtime():
     with httpx.Client(base_url=_base_url(), timeout=15) as client:
         page = client.get("/")
         assert page.status_code == 200
-        assert "Enterprise Multi-Source AI Agent" in page.text
+        assert "<title>企业多源智能助手</title>" in page.text
+        assert 'lang="zh-CN"' in page.text
         health = client.get("/api/v1/health")
         assert health.status_code == 200
         assert health.json()["services"] == {

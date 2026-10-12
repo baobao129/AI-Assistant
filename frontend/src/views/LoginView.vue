@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { LogIn } from '@lucide/vue'
 import { ApiError, api, session } from '../api'
+import { errorMessage } from '../labels'
 
 const username = ref('demo')
 const password = ref('')
@@ -25,8 +26,8 @@ async function submit() {
     error.value =
       // 401 统一提示凭据无效，其余错误沿用后端消息。
       failure instanceof ApiError && failure.status === 401
-        ? 'Invalid credentials.'
-        : failure.message || 'Sign in failed.'
+        ? '账号或密码不正确。'
+        : errorMessage(failure, '登录失败，请稍后重试。')
   } finally {
     busy.value = false
   }
@@ -35,19 +36,15 @@ async function submit() {
 
 <template>
   <div class="auth-card">
-    <p class="eyebrow">Authentication</p>
-    <h1>Sign in</h1>
-    <p class="muted">
-      Minimal MVP authentication. Protected Conversation, Run, Approval, Document, Ingestion,
-      and Structured Data APIs require this session.
-    </p>
+    <p class="eyebrow">企业多源智能助手</p>
+    <h1>登录</h1>
     <form @submit.prevent="submit">
       <label>
-        Username
+        用户名
         <input v-model="username" name="username" autocomplete="username" required />
       </label>
       <label>
-        Password
+        密码
         <input
           v-model="password"
           name="password"
@@ -59,7 +56,7 @@ async function submit() {
       <p v-if="error" class="alert" role="alert">{{ error }}</p>
       <button class="primary" type="submit" :disabled="busy">
         <LogIn :size="18" aria-hidden="true" />
-        {{ busy ? 'Signing in' : 'Sign in' }}
+        {{ busy ? '登录中' : '登录' }}
       </button>
     </form>
   </div>

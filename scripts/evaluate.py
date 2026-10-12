@@ -4,7 +4,6 @@
 Application Events 与答案接地性，并把 Markdown Report 写到
 ``runtime/evaluation-report.md``。
 
-    ./scripts/dev-env.ps1 | Out-Null
     uv run python -m scripts.evaluate
 
 评估不是 CI 阻断门禁；Report 记录实际观察到的结果与所适用的限制。
@@ -14,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -21,8 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from scripts.evaluation_dataset import DATASET_VERSION, EVAL_DATASET, EvalCase, dataset_summary
-from scripts.live_defaults import live_credentials_missing
-from scripts.verify_live import live_settings
+from scripts.retrieval_baseline import host_settings
 
 REPORT_PATH = Path("runtime/evaluation-report.md")
 TRAVEL_POLICY = (
@@ -50,8 +49,12 @@ class EvaluationRun:
         from backend.api.dependencies import build_container
         from backend.api.main import create_app
 
-        self.settings = live_settings()
-        missing = live_credentials_missing()
+        self.settings = host_settings("hybrid_rerank")
+        missing = [
+            name
+            for name in ("mysql_password", "mysql_readonly_password", "auth_bootstrap_password")
+            if not getattr(self.settings, name).get_secret_value()
+        ]
         if missing:
             raise SystemExit(f"Missing live credentials: {', '.join(missing)}")
         self.container = build_container(self.settings)
@@ -80,8 +83,12 @@ class EvaluationRun:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        self.client.__exit__(None, None, None)
-        self.container.close()
+        try:
+            if self.document_id:
+                self.client.delete(f"/api/v1/documents/{self.document_id}", headers=self.headers)
+        finally:
+            self.client.__exit__(None, None, None)
+            self.container.close()
 
     # 准备 ---------------------------------------------------------------
     def ensure_knowledge_document(self) -> str:
@@ -95,7 +102,7 @@ class EvaluationRun:
             "/api/v1/documents",
             files={
                 "file": (
-                    "evaluation-travel-policy.md",
+                    f"evaluation-travel-policy-{self.marker}.md",
                     body.encode("utf-8"),
                     "text/markdown",
                 )
@@ -139,6 +146,8 @@ class EvaluationRun:
     def run_case(self, case: EvalCase) -> CaseResult:
         if case.family == "ingestion":
             return self._ingestion_case(case)
+        if case.case_id == "structured-unsafe-sql":
+            return self._unsafe_sql_case(case)
         accepted = self.client.post(
             f"/api/v1/conversations/{self.conversation_id}/runs",
             json={"user_input": case.user_input.format(marker=self.marker)},
@@ -169,6 +178,7 @@ class EvaluationRun:
         event_types = [event["event_type"] for event in events]
         final = next((event for event in events if event["event_type"] == "final"), None)
         answer = (final or {}).get("payload", {}).get("content", "")
+        payload = (final or {}).get("payload", {})
         observed = {
             "run_id": run_id,
             "status": state.get("status"),
@@ -176,8 +186,31 @@ class EvaluationRun:
             "routing_outcome": state.get("routing_outcome"),
             "events": event_types,
             "answer": answer[:400],
+            "error_code": payload.get("error_code"),
+            "validation_status": payload.get("validation_status"),
         }
         failures: list[str] = []
+        if case.case_id == "knowledge-grounded-answer":
+            if payload.get("validation_status") != "validated" or payload.get("error_code"):
+                failures.append("knowledge positive did not produce a validated answer")
+            if not payload.get("citations") or not re.search("economy|经济舱", answer, re.I):
+                failures.append(
+                    "knowledge positive missing the supported economy-class fact/citation"
+                )
+        if case.case_id == "knowledge-insufficient-evidence":
+            if payload.get("validation_status") != "insufficient_evidence" or payload.get(
+                "citations"
+            ):
+                failures.append("no-answer case did not safely report insufficient evidence")
+        if case.family == "structured_data":
+            record = self.container.runtime.runs.get(run_id)
+            snapshot = (
+                self.container.runtime.query_results.get(record.query_result_id)
+                if record and record.query_result_id
+                else None
+            )
+            if payload.get("validation_status") != "validated" or not snapshot:
+                failures.append("structured answer has no validated query snapshot")
         hitl_events: list[str] = []
         if case.family == "hitl":
             # 先做出审批决策再断言事件：等待中的 Run 流可能在暂停点关闭，
@@ -359,12 +392,62 @@ class EvaluationRun:
         observed["successor_answer"] = (
             (successor_final or {}).get("payload", {}).get("content", "")[:200]
         )
+        successor_state = self.client.get(f"/api/v1/runs/{successor}", headers=self.headers).json()
+        export_success = any(
+            event["event_type"] == "tool_result"
+            and event["payload"].get("tool_id") == "data_export"
+            and event["payload"].get("status") == "success"
+            for event in successor_events
+        )
         if (
             not successor_final
-            or "export completed" not in successor_final["payload"]["content"].casefold()
+            or successor_state.get("status") != "completed"
+            or not export_success
         ):
             failures.append("the successor Run did not complete the approved export")
         return failures
+
+    def _unsafe_sql_case(self, case: EvalCase) -> CaseResult:
+        from backend.tools.contracts import ToolExecutionContext
+
+        user = self.client.get("/api/v1/auth/me", headers=self.headers).json()
+        context = ToolExecutionContext(user_id=user["user_id"], run_id=f"e{uuid.uuid4().hex[:31]}")
+        arguments = {
+            "data_source_id": self.settings.data_source_id,
+            "sql": "SELECT COUNT(*) AS row_count FROM sales_orders LIMIT 1",
+        }
+        before = self.container.tools.invoke("database_query", "before", arguments, context)
+        rejected = self.container.tools.invoke(
+            "database_query",
+            "unsafe",
+            {"data_source_id": self.settings.data_source_id, "sql": "DROP TABLE sales_orders"},
+            context,
+        )
+        after = self.container.tools.invoke("database_query", "after", arguments, context)
+        failures = []
+        if (
+            rejected.status != "rejected"
+            or not rejected.error
+            or rejected.error.code != "sql_rejected"
+        ):
+            failures.append("unsafe SQL was not rejected by the Tool/Validator boundary")
+        if (
+            before.status != "success"
+            or after.status != "success"
+            or before.data.get("rows") != after.data.get("rows")
+        ):
+            failures.append("data changed or could not be read around the rejected operation")
+        return CaseResult(
+            case,
+            not failures,
+            {
+                "probe": "Tool Registry -> Executor -> SQL Validator -> read-only Database",
+                "status": rejected.status,
+                "error_code": rejected.error.code if rejected.error else None,
+                "data_unchanged": before.data.get("rows") == after.data.get("rows"),
+            },
+            failures,
+        )
 
     def _ingestion_case(self, case: EvalCase) -> CaseResult:
         failures: list[str] = []
@@ -516,7 +599,17 @@ def main() -> int:
     )
     results: list[CaseResult] = []
     with EvaluationRun() as evaluation:
-        setup_notes = {"knowledge_document": evaluation.ensure_knowledge_document()}
+        setup_notes = {
+            "knowledge_document": evaluation.ensure_knowledge_document(),
+            "embedding_profile": (
+                f"{evaluation.settings.embedding_provider}/"
+                f"{evaluation.settings.embedding_model}/"
+                f"dim={evaluation.settings.embedding_dimension}"
+            ),
+            "llm_profile": (f"{evaluation.settings.llm_provider}/{evaluation.settings.llm_model}"),
+            "retrieval_mode": evaluation.settings.retrieval_mode,
+            "command": ".venv\\Scripts\\python.exe -m scripts.evaluate",
+        }
         for case in EVAL_DATASET:
             result = evaluation.run_case(case)
             results.append(result)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from backend.domain.state import MAX_DOCUMENT_SCOPE_IDS
 
 
 class ErrorDetail(BaseModel):
@@ -78,11 +81,38 @@ class MessageListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+# Requested Document IDs 只接受**不透明标识符**（ADR-039 / CC-API-002）：路径、URL、
+# 文件名与查询串都会因为分隔符或非法字符被拒，作用域不能承载任何任意查询条件。
+_DOCUMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_input: str = Field(min_length=1, max_length=4000)
     thread_id: str | None = Field(default=None, max_length=64)
+    # 用户提交的文档作用域（**未经授权证明**）。缺省与空数组都表示「无作用域」。
+    # 这里只做格式校验；授权校验属于 Application 层。
+    document_ids: list[str] | None = None
     client_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("document_ids")
+    @classmethod
+    def _validate_document_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        unique: list[str] = []
+        for item in value:
+            token = item.strip() if isinstance(item, str) else ""
+            if not _DOCUMENT_ID_PATTERN.fullmatch(token):
+                raise ValueError(
+                    "Document identifiers must be opaque identifiers of at most 64 characters."
+                )
+            if token not in unique:
+                unique.append(token)
+        # 先去重（保留首次出现顺序）再判上限：重复项不占用名额。
+        if len(unique) > MAX_DOCUMENT_SCOPE_IDS:
+            raise ValueError(f"At most {MAX_DOCUMENT_SCOPE_IDS} document identifiers are allowed.")
+        return unique
 
 
 class RunAcceptedResponse(BaseModel):

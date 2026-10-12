@@ -57,8 +57,12 @@ def create_run(
         user_input=payload.user_input,
         thread_id=payload.thread_id,
         client_metadata=payload.client_metadata,
+        # Requested Document IDs：Application 层在这里把它校验成授权集合的子集
+        # （ADR-039）；不满足即 409 document_scope_unavailable，且没有任何副作用。
+        document_ids=payload.document_ids,
     )
-    if not dispatcher.dispatch(handle.run_id):
+    # 已校验的作用域只在进程内从 start_run 传到调度器（不落库、不进 API 响应）。
+    if not dispatcher.dispatch(handle.run_id, document_scope=handle.document_scope):
         # 调度容量耗尽：这个 Run 永远不会开始执行，必须以安全终态收口（带终态事件），
         # 而不是停留在 ``accepted``；普通 Run 不在维护任务的恢复范围内，没有其他补救路径。
         container.runs.fail_run_safely(

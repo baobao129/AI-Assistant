@@ -291,6 +291,60 @@ def test_mineru_parser_polling_is_bounded_by_timeout(monkeypatch):
     assert len([call for call in fake.calls if call[0] == "get"]) < 20
 
 
+def test_mineru_parser_keeps_the_batch_id_and_resumes_after_a_timeout(monkeypatch):
+    # 轮询超时 ≠ 任务未创建：batch id 必须保留，续轮询同一任务即可拿到结果（ADR-037）。
+    post = _FakeResponse(
+        payload={"code": 0, "data": {"batch_id": "b-resume", "file_urls": ["https://up.example/p"]}}
+    )
+    running = _FakeResponse(payload={"code": 0, "data": {"extract_result": [{"state": "running"}]}})
+    monkeypatch.setattr(
+        "backend.infrastructure.parsers.httpx", _FakeHTTPX(post_response=post, default_poll=running)
+    )
+    parser = _mineru_parser(timeout=0.05)
+    task = parser.submit(filename="a.pdf", content_type="application/pdf", data=b"%PDF-fake")
+    assert task.batch_id == "b-resume"
+    with pytest.raises(ParserError) as failure:
+        parser.fetch(task.batch_id)
+    # 超时有独立的安全码，与「提交失败」区分开。
+    assert str(failure.value) == "parse_timeout"
+
+    done = _FakeResponse(
+        payload={
+            "code": 0,
+            "data": {
+                "extract_result": [{"state": "done", "full_zip_url": "https://cdn.example/z.zip"}]
+            },
+        }
+    )
+    resume_fake = _FakeHTTPX(
+        post_response=post,
+        poll_responses=[done],
+        zip_response=_FakeResponse(content=_zip_with_markdown("# Resumed\n")),
+    )
+    monkeypatch.setattr("backend.infrastructure.parsers.httpx", resume_fake)
+    parsed = parser.fetch("b-resume", title="a.pdf")
+
+    assert "Resumed" in parsed.text
+    # 续轮询只有查询与下载：绝不重复提交（否则会重复消耗额度）。
+    assert [call[0] for call in resume_fake.calls] == ["get", "stream"]
+
+
+def test_mineru_suffixes_match_the_measured_provider_capability_matrix():
+    # ADR-037 实测结论：xlsx/docx/pptx 支持；html 被 pipeline 模型版本在提交阶段拒绝；
+    # xls（BIFF8）未获证明，保持拒绝。
+    for suffix in (".pdf", ".docx", ".pptx", ".xlsx", ".png"):
+        assert supported_content_type(
+            "application/octet-stream", f"a{suffix}", allow_remote_parser=True
+        ), suffix
+    for suffix in (".html", ".htm", ".xls"):
+        assert not supported_content_type(
+            "application/octet-stream", f"a{suffix}", allow_remote_parser=True
+        ), suffix
+    # HTML 即使带着 text/* 的 content type 也要在提交前明确拒绝。
+    assert not supported_content_type("text/html", "page.html", allow_remote_parser=True)
+    assert not supported_content_type("text/html", "page.html")
+
+
 def test_mineru_suffixes_are_gated_by_parser_provider():
     # 轻量解析器不接受 PDF/图片；仅当 parser_provider=mineru 时放行其官方支持类型。
     assert not supported_content_type("application/pdf", "a.pdf")

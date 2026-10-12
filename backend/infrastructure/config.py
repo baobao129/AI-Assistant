@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     embedding_api_key: SecretStr = SecretStr("")
     embedding_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     embedding_batch_size: int = Field(default=32, ge=1, le=128)
+    # Rerank 与 Embedding 共用 base URL/API key；仅通过模型名区分调用路径。
+    rerank_enabled: bool = True
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    rerank_top_n: int = Field(default=20, ge=1, le=50)
+    retrieval_mode: Literal[
+        "dense", "dense_parent", "dense_bm25", "dense_rerank", "hybrid_rerank"
+    ] = "hybrid_rerank"
+    rerank_max_document_chars: int = Field(default=4096, ge=256, le=16000)
+    rerank_max_total_chars: int = Field(default=80000, ge=4096, le=200000)
 
     # Parser
     parser_provider: Literal["lightweight", "mineru"] = "lightweight"
@@ -87,7 +97,7 @@ class Settings(BaseSettings):
     # 远端 MinerU v4 单份硬限（官方文档：≤200,000,000 字节 **且** ≤200 页，两者都要满足）。
     # 超过它的非分片文件在本地就明确失败，不把必然被拒的文件送给 provider。
     mineru_max_bytes: int = Field(default=200_000_000, ge=1024, le=200_000_000)
-    mineru_max_pages: int = Field(default=200, ge=1, le=2000)
+    mineru_max_pages: int = Field(default=200, ge=1, le=200)
     # 上传前的受控存储余量门控：低于该值时明确拒绝上传（409），而不是写到一半磁盘满。
     min_storage_free_bytes: int = Field(default=268_435_456, ge=0)
     # 解析文本的**显式预算**（不是静默截断）：超过即 Job 失败 extracted_text_too_large。
@@ -104,6 +114,18 @@ class Settings(BaseSettings):
     chunk_size_chars: int = Field(default=800, ge=100, le=4000)
     chunk_overlap_chars: int = Field(default=120, ge=0, le=1000)
     parent_chunk_chars: int = Field(default=2400, ge=200, le=20000)
+    # 结构化分块的 token 预算（ADR-038 决策 4/5）：provider 提供结构化块时按 token 切分，
+    # 而不是按字符。估计是**保守上界**（CJK 1 token/字符、非 CJK 1/3），因此中文与英文
+    # 用同一个预算会得到不同字符数 —— 这正是「不把中文字符数等同 token 数」的落地。
+    parent_chunk_tokens: int = Field(default=1800, ge=100, le=20000)
+    chunk_tokens: int = Field(default=600, ge=50, le=4000)
+    chunk_overlap_tokens: int = Field(default=100, ge=0, le=1000)
+    # 章节路径的最大层级（有界：State 与检索结果都必须有界）。
+    max_section_depth: int = Field(default=4, ge=1, le=8)
+    # 上下文构建的 token 预算（与字符上限共同约束，取先到者）。
+    max_context_tokens: int = Field(default=3000, ge=200, le=30000)
+    # 一次上下文构建最多展开多少个**不同**的父块（按 parent chunk ID 去重后计数）。
+    max_parent_expansion: int = Field(default=8, ge=1, le=50)
     # 批处理边界：向量写入按批提交，避免大文档产生单次无界的 Milvus 请求。
     vector_upsert_batch_size: int = Field(default=256, ge=1, le=2000)
     max_retrieval_top_k: int = Field(default=20, ge=1, le=50)

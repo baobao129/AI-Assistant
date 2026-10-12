@@ -113,7 +113,7 @@ def test_knowledge_path_without_evidence_returns_safe_outcome():
         )
     )
     assert result["answer_validation"]["status"] == "insufficient_evidence"
-    assert "Insufficient evidence" in result["final_response"]
+    assert "没有足够证据" in result["final_response"]
 
 
 def test_structured_data_tool_failure_reaches_safe_terminal_outcome():

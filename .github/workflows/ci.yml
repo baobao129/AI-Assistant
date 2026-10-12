@@ -1,0 +1,132 @@
+name: Contract regression
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: python-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.16
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run python -m scripts.ci_gates python --out runtime/ci-readiness/python
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            runtime/ci-readiness/python/artifacts/source-manifest.json
+            runtime/ci-readiness/python/artifacts/summary.json
+            runtime/ci-readiness/python/artifacts/ruff-check.json
+            runtime/ci-readiness/python/artifacts/ruff-format.json
+            runtime/ci-readiness/python/artifacts/unit.json
+            runtime/ci-readiness/python/artifacts/unit.xml
+            runtime/ci-readiness/python/artifacts/nonlive.json
+            runtime/ci-readiness/python/artifacts/nonlive.xml
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: frontend-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.16
+          python-version: '3.12'
+      - run: uv sync --frozen
+      - run: uv run python -m scripts.ci_gates frontend --out runtime/ci-readiness/frontend
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            runtime/ci-readiness/frontend/artifacts/source-manifest.json
+            runtime/ci-readiness/frontend/artifacts/summary.json
+            runtime/ci-readiness/frontend/artifacts/frontend-install.json
+            runtime/ci-readiness/frontend/artifacts/frontend-test.json
+            runtime/ci-readiness/frontend/artifacts/frontend-build.json
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+  live-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: live-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.16
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run python -m scripts.ci_gates live --out runtime/ci-readiness/live
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            runtime/ci-readiness/live/artifacts/source-manifest.json
+            runtime/ci-readiness/live/artifacts/summary.json
+            runtime/ci-readiness/live/artifacts/isolation.json
+            runtime/ci-readiness/live/artifacts/cleanup.json
+            runtime/ci-readiness/live/artifacts/integration.json
+            runtime/ci-readiness/live/artifacts/integration.xml
+            runtime/ci-readiness/live/artifacts/cursor.json
+            runtime/ci-readiness/live/artifacts/cursor.xml
+            runtime/ci-readiness/live/artifacts/restart-result.json
+            runtime/ci-readiness/live/artifacts/provider-call-counters.json
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false
+  recovery-drill:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    concurrency:
+      group: recovery-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.16
+          python-version: '3.12'
+      - run: uv sync --frozen
+      - run: uv run python -m scripts.ci_gates recovery --out runtime/ci-readiness/recovery
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            runtime/ci-readiness/recovery/artifacts/source-manifest.json
+            runtime/ci-readiness/recovery/artifacts/summary.json
+            runtime/ci-readiness/recovery/artifacts/recovery.json
+            runtime/ci-readiness/recovery/artifacts/smoke.json
+            runtime/ci-readiness/recovery/artifacts/smoke.xml
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: false

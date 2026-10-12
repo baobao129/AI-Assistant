@@ -8,6 +8,7 @@ CanonicalErrorCode = Literal[
     "validation_error",
     "not_found",
     "conflict",
+    "document_scope_unavailable",
     "rate_limit",
     "timeout",
     "unsupported",
@@ -74,6 +75,18 @@ def conflict(message: str = "The request conflicts with the current state.") -> 
 
 def validation_error(message: str = "Invalid field values.") -> AppError:
     return AppError("validation_error", message, status_code=422)
+
+
+def document_scope_unavailable(
+    message: str = "One or more selected documents are not available for this request.",
+) -> AppError:
+    """文档作用域无法满足（ADR-039 / CC-API-002）。
+
+    未授权、已删除、重建中、不存在与版本状态异常一律返回**同一个**码与同一段文案：
+    绝不说明具体原因，因此不会泄漏他人文档是否存在。
+    """
+
+    return AppError("document_scope_unavailable", message, status_code=409)
 
 
 def unsupported(message: str = "The request is not supported.") -> AppError:

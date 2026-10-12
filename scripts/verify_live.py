@@ -80,7 +80,12 @@ def main() -> int:
         )
         login = client.post(
             "/api/v1/auth/login",
-            json={"username": settings.auth_bootstrap_username, "password": "demo-password"},
+            json={
+                "username": settings.auth_bootstrap_username,
+                # 凭据只来自受控的 TEST_* 环境（live_defaults 已校验其存在），
+                # 绝不硬编码任何默认口令。
+                "password": settings.auth_bootstrap_password.get_secret_value(),
+            },
         )
         check("login", login.status_code == 200, login.status_code)
         if login.status_code != 200:
@@ -277,7 +282,9 @@ def main() -> int:
                     "knowledge_answer_grounded",
                     bool(
                         final
-                        and "insufficient evidence" not in final["payload"]["content"].casefold()
+                        and final["payload"].get("validation_status") == "validated"
+                        and not final["payload"].get("error_code")
+                        and final["payload"].get("citations")
                     ),
                     final and final["payload"]["content"][:100],
                 )
@@ -395,8 +402,13 @@ def main() -> int:
                             "successor_export_completed",
                             bool(
                                 successor_final
-                                and "export completed"
-                                in successor_final["payload"]["content"].casefold()
+                                and successor_state["status"] == "completed"
+                                and any(
+                                    event["event_type"] == "tool_result"
+                                    and event["payload"].get("tool_id") == "data_export"
+                                    and event["payload"].get("status") == "success"
+                                    for event in successor_stream
+                                )
                             ),
                             successor_state["status"],
                         )

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from backend.domain.identifiers import new_id, utc_now
+from backend.domain.identifiers import cursor_from_utc, cursor_to_utc, new_id, utc_now
 from backend.infrastructure.database import MySQLConnectionPool
 
 INDEX_STATUS_ACTIVE = "active"
@@ -19,8 +19,23 @@ JOB_STATUS_RUNNING = "running"
 JOB_STATUS_SUCCESS = "success"
 JOB_STATUS_FAILED = "failed"
 
+# Document 生命周期（ADR-040 / CC-API-003）：
+#   indexing  已接受并持久化，但还没有 promote 过的版本 —— 不可检索、不可作为作用域
+#   available 有合法 active 版本 —— **唯一**可检索、可被选为作用域的取值
+#   failed    摄取结束但没有可用版本 —— 不可检索，应重试或删除
+#   deleted   终态，promote 永远不会重新激活
+DOCUMENT_STATUS_INDEXING = "indexing"
 DOCUMENT_STATUS_AVAILABLE = "available"
+DOCUMENT_STATUS_FAILED = "failed"
 DOCUMENT_STATUS_DELETED = "deleted"
+
+# 分片 manifest 状态机（ADR-037）：pending -> running -> success | failed。
+# ``reused`` 是 success 的一个子情形（命中复用键，未调用 provider），不是独立状态，
+# 这样「分片闭合 = 全部 success」的完整性判据保持单一。
+SHARD_STATUS_PENDING = "pending"
+SHARD_STATUS_RUNNING = "running"
+SHARD_STATUS_SUCCESS = "success"
+SHARD_STATUS_FAILED = "failed"
 
 DOCUMENT_COLUMNS = (
     "document_id, user_id, title, source_name, content_type, content_fingerprint, byte_size, "
@@ -37,6 +52,11 @@ JOB_COLUMNS = (
 )
 DOCUMENT_FILE_COLUMNS = (
     "document_id, storage_key, sha256, byte_size, content_type, source_name, created_at, updated_at"
+)
+SHARD_COLUMNS = (
+    "shard_id, ingestion_job_id, document_id, index_version, shard_index, page_start, page_end, "
+    "byte_size, sha256, parser_provider, parser_options, provider_batch_id, status, reused, "
+    "attempt, char_count, failure_code, created_at, updated_at, finished_at"
 )
 
 
@@ -104,6 +124,44 @@ class DocumentFileRecord:
 
 
 @dataclass(frozen=True)
+class IngestionShardRecord:
+    """一个分片的 manifest 行（ADR-037）：页范围、字节、复用键与 provider 任务凭据。
+
+    ``extracted_text`` 只在显式请求时读取（``with_text=True``），因为分片文本可能很大；
+    ``reused`` 表示这一片没有调用 provider，而是命中了复用键。
+    """
+
+    shard_id: str
+    ingestion_job_id: str
+    document_id: str
+    index_version: str
+    shard_index: int
+    page_start: int | None
+    page_end: int | None
+    byte_size: int
+    sha256: str
+    parser_provider: str
+    parser_options: str
+    provider_batch_id: str | None
+    status: str
+    reused: bool
+    attempt: int
+    char_count: int
+    failure_code: str | None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None
+    extracted_text: str | None = None
+    blocks_json: str | None = None
+
+    @property
+    def page_count(self) -> int:
+        if self.page_start is None or self.page_end is None:
+            return 0
+        return self.page_end - self.page_start + 1
+
+
+@dataclass(frozen=True)
 class ChunkRecord:
     chunk_id: str
     document_id: str
@@ -114,6 +172,13 @@ class ChunkRecord:
     content: str
     location: str | None
     label: str
+    # 结构元数据（ADR-038）：无可靠来源时保持 None/默认值，绝不伪造。
+    section_path: str | None = None
+    block_type: str = "paragraph"
+    page_start: int | None = None
+    page_end: int | None = None
+    content_hash: str | None = None
+    token_count: int = 0
 
 
 class DocumentRepository:
@@ -145,7 +210,9 @@ class DocumentRepository:
                 content_type[:100],
                 content_fingerprint,
                 byte_size,
-                DOCUMENT_STATUS_AVAILABLE,
+                # 上传即 available 会让「已上传」与「可检索」混为一谈（G19）：
+                # 新文档一律从 indexing 开始，promote 才是唯一进入 available 的路径。
+                DOCUMENT_STATUS_INDEXING,
                 now,
                 now,
             ),
@@ -158,7 +225,7 @@ class DocumentRepository:
             content_type[:100],
             content_fingerprint,
             byte_size,
-            DOCUMENT_STATUS_AVAILABLE,
+            DOCUMENT_STATUS_INDEXING,
             None,
             now,
             now,
@@ -183,8 +250,11 @@ class DocumentRepository:
         parameters: list[Any] = [user_id]
         clause = ""
         if cursor:
-            clause = "AND created_at < FROM_UNIXTIME(%s / 1000000)"
-            parameters.append(cursor)
+            # MySQL DATETIME(6) is stored as naive UTC.  Bind the decoded UTC
+            # datetime instead of using FROM_UNIXTIME(), whose result depends
+            # on the connection/session timezone.
+            clause = "AND created_at < %s"
+            parameters.append(cursor_to_utc(cursor))
         parameters.append(limit + 1)
         rows = self.pool.query(
             f"SELECT {DOCUMENT_COLUMNS} FROM documents "
@@ -193,11 +263,7 @@ class DocumentRepository:
             parameters,
         )
         items = [record for row in rows[:limit] if (record := _document(row)) is not None]
-        next_cursor = (
-            f"{int(items[-1].created_at.timestamp() * 1_000_000)}"
-            if len(rows) > limit and items
-            else None
-        )
+        next_cursor = cursor_from_utc(items[-1].created_at) if len(rows) > limit and items else None
         return items, next_cursor
 
     def find_by_fingerprint(self, *, user_id: str, fingerprint: str) -> DocumentRecord | None:
@@ -223,6 +289,45 @@ class DocumentRepository:
             "WHERE document_id = %s",
             (index_version, utc_now(), document_id),
         )
+
+    def activate(self, document_id: str, index_version: str) -> bool:
+        """把文档原子地置为 ``available`` 并绑定 active 版本（ADR-040 决策 2）。
+
+        状态与 active 版本写在**同一条**条件 UPDATE 里，因此二者不会出现不一致的中间态；
+        ``deleted`` 的文档永远不会被重新激活。
+        """
+
+        affected = self.pool.execute(
+            "UPDATE documents SET status = %s, active_index_version = %s, updated_at = %s "
+            "WHERE document_id = %s AND status <> %s",
+            (
+                DOCUMENT_STATUS_AVAILABLE,
+                index_version,
+                utc_now(),
+                document_id,
+                DOCUMENT_STATUS_DELETED,
+            ),
+        )
+        return affected > 0
+
+    def mark_failed(self, document_id: str) -> bool:
+        """摄取失败后把**没有可用版本**的文档置为 ``failed``（ADR-040 决策 3）。
+
+        带 ``active_index_version IS NULL`` 守卫：失败的**重建索引**绝不能降级一个仍在
+        用旧版本服务的文档。
+        """
+
+        affected = self.pool.execute(
+            "UPDATE documents SET status = %s, updated_at = %s "
+            "WHERE document_id = %s AND status <> %s AND active_index_version IS NULL",
+            (
+                DOCUMENT_STATUS_FAILED,
+                utc_now(),
+                document_id,
+                DOCUMENT_STATUS_DELETED,
+            ),
+        )
+        return affected > 0
 
     def is_available(self, document_id: str) -> bool:
         row = self.pool.query_one(
@@ -516,15 +621,51 @@ class IngestionJobRepository:
                 "AND status <> 'active'",
                 (INDEX_STATUS_FAILED, now, *versions),
             )
+            # 文档也要有诚实的终态（ADR-040 决策 3）：只有**没有可用版本**的文档才降级，
+            # 因此陈旧恢复不会影响仍在服务旧版本的文档。
+            document_placeholders = ", ".join(["%s"] * len(versions))
+            cursor.execute(
+                "UPDATE documents SET status = %s, updated_at = %s "
+                f"WHERE status <> %s AND active_index_version IS NULL "
+                f"AND document_id IN (SELECT document_id FROM ingestion_jobs "
+                f"WHERE index_version IN ({document_placeholders}))",
+                (DOCUMENT_STATUS_FAILED, now, DOCUMENT_STATUS_DELETED, *versions),
+            )
         return len(job_ids)
 
     def fail_orphaned_pending(self, *, older_than: datetime) -> int:
-        return self.pool.execute(
-            "UPDATE ingestion_jobs SET status = %s, failure_code = 'orphaned_pending_job', "
-            "failure_message = 'Job was never claimed by a worker.', updated_at = %s, "
-            "finished_at = %s WHERE status = %s AND claimed_at IS NULL AND created_at < %s",
-            (JOB_STATUS_FAILED, utc_now(), utc_now(), JOB_STATUS_PENDING, older_than),
-        )
+        """把从未被领取的 ``pending`` Job 收口为 ``failed``，并同步文档终态。
+
+        文档侧同样带 ``active_index_version IS NULL`` 守卫（ADR-040 决策 3）。
+        """
+
+        now = utc_now()
+        with self.pool.transaction() as cursor:
+            cursor.execute(
+                "SELECT ingestion_job_id, document_id FROM ingestion_jobs "
+                "WHERE status = %s AND claimed_at IS NULL AND created_at < %s",
+                (JOB_STATUS_PENDING, older_than),
+            )
+            rows = list(cursor.fetchall())
+            if not rows:
+                return 0
+            job_ids = [str(row[0]) for row in rows]
+            document_ids = [str(row[1]) for row in rows]
+            placeholders = ", ".join(["%s"] * len(job_ids))
+            cursor.execute(
+                "UPDATE ingestion_jobs SET status = %s, failure_code = 'orphaned_pending_job', "
+                "failure_message = 'Job was never claimed by a worker.', updated_at = %s, "
+                f"finished_at = %s WHERE ingestion_job_id IN ({placeholders})",
+                (JOB_STATUS_FAILED, now, now, *job_ids),
+            )
+            document_placeholders = ", ".join(["%s"] * len(document_ids))
+            cursor.execute(
+                "UPDATE documents SET status = %s, updated_at = %s "
+                f"WHERE document_id IN ({document_placeholders}) AND status <> %s "
+                "AND active_index_version IS NULL",
+                (DOCUMENT_STATUS_FAILED, now, *document_ids, DOCUMENT_STATUS_DELETED),
+            )
+        return len(job_ids)
 
     def list_pending(self, *, older_than: datetime, limit: int) -> list[str]:
         """等待超过阈值仍未领取的 pending Job（维护任务的补调度候选，有界）。
@@ -614,6 +755,229 @@ class DocumentFileRepository:
         return affected > 0
 
 
+class IngestionShardRepository:
+    """分片 manifest 的持久化（ADR-037）。
+
+    它同时承担三件事，缺一不可：
+
+    1. **闭合**：``UNIQUE(index_version, shard_index)`` 保证一个 index version 的每个
+       分片序号唯一，完整性校验据此证明「无缺片、无重叠」。
+    2. **复用**：``find_reusable`` 按 ``(sha256, parser_provider, parser_options)`` 命中
+       已成功的分片，直接复制文本、**不调用 provider**（成功分片不重复付费解析）。
+    3. **恢复**：``find_resumable`` 找回「已 submit、但轮询超时」的分片 batch id，
+       重试时续轮询同一个 provider 任务，绝不重复提交。
+    """
+
+    def __init__(self, pool: MySQLConnectionPool) -> None:
+        self.pool = pool
+
+    def create(
+        self,
+        *,
+        ingestion_job_id: str,
+        document_id: str,
+        index_version: str,
+        shard_index: int,
+        byte_size: int,
+        sha256: str,
+        parser_provider: str,
+        parser_options: str,
+        page_start: int | None = None,
+        page_end: int | None = None,
+        provider_batch_id: str | None = None,
+        blocks_json: str | None = None,
+    ) -> IngestionShardRecord:
+        shard_id = new_id()
+        now = utc_now()
+        self.pool.execute(
+            "INSERT INTO ingestion_shards (shard_id, ingestion_job_id, document_id, index_version, "
+            "shard_index, page_start, page_end, byte_size, sha256, parser_provider, "
+            "parser_options, provider_batch_id, status, reused, attempt, char_count, blocks_json, "
+            "created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 0, %s, %s, %s)",
+            (
+                shard_id,
+                ingestion_job_id,
+                document_id,
+                index_version,
+                shard_index,
+                page_start,
+                page_end,
+                byte_size,
+                sha256,
+                parser_provider[:40],
+                parser_options[:120],
+                provider_batch_id[:120] if provider_batch_id else None,
+                SHARD_STATUS_PENDING,
+                blocks_json,
+                now,
+                now,
+            ),
+        )
+        return IngestionShardRecord(
+            shard_id=shard_id,
+            ingestion_job_id=ingestion_job_id,
+            document_id=document_id,
+            index_version=index_version,
+            shard_index=shard_index,
+            page_start=page_start,
+            page_end=page_end,
+            byte_size=byte_size,
+            sha256=sha256,
+            parser_provider=parser_provider[:40],
+            parser_options=parser_options[:120],
+            provider_batch_id=provider_batch_id,
+            status=SHARD_STATUS_PENDING,
+            reused=False,
+            attempt=0,
+            char_count=0,
+            failure_code=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=None,
+            blocks_json=blocks_json,
+        )
+
+    def get(self, shard_id: str, *, with_text: bool = False) -> IngestionShardRecord | None:
+        columns = SHARD_COLUMNS + (", extracted_text, blocks_json" if with_text else "")
+        row = self.pool.query_one(
+            f"SELECT {columns} FROM ingestion_shards WHERE shard_id = %s", (shard_id,)
+        )
+        return _shard(row, with_text=with_text)
+
+    def get_by_index(
+        self, *, index_version: str, shard_index: int, with_text: bool = False
+    ) -> IngestionShardRecord | None:
+        """按 ``(index_version, shard_index)`` 取分片：同一版本内的重试原地推进 attempt。"""
+
+        columns = SHARD_COLUMNS + (", extracted_text, blocks_json" if with_text else "")
+        row = self.pool.query_one(
+            f"SELECT {columns} FROM ingestion_shards WHERE index_version = %s AND shard_index = %s",
+            (index_version, shard_index),
+        )
+        return _shard(row, with_text=with_text)
+
+    def list_for_job(
+        self, ingestion_job_id: str, *, with_text: bool = False
+    ) -> list[IngestionShardRecord]:
+        columns = SHARD_COLUMNS + (", extracted_text, blocks_json" if with_text else "")
+        rows = self.pool.query(
+            f"SELECT {columns} FROM ingestion_shards WHERE ingestion_job_id = %s "
+            "ORDER BY shard_index ASC",
+            (ingestion_job_id,),
+        )
+        return [record for row in rows if (record := _shard(row, with_text=with_text)) is not None]
+
+    def list_for_version(
+        self, index_version: str, *, with_text: bool = False
+    ) -> list[IngestionShardRecord]:
+        columns = SHARD_COLUMNS + (", extracted_text, blocks_json" if with_text else "")
+        rows = self.pool.query(
+            f"SELECT {columns} FROM ingestion_shards WHERE index_version = %s "
+            "ORDER BY shard_index ASC",
+            (index_version,),
+        )
+        return [record for row in rows if (record := _shard(row, with_text=with_text)) is not None]
+
+    def claim(self, shard_id: str) -> bool:
+        """``pending`` -> ``running``（并累加 attempt）；已是其它状态则不重复领取。"""
+
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE ingestion_shards SET status = %s, attempt = attempt + 1, updated_at = %s "
+            "WHERE shard_id = %s AND status = %s",
+            (SHARD_STATUS_RUNNING, now, shard_id, SHARD_STATUS_PENDING),
+        )
+        return affected > 0
+
+    def set_provider_batch_id(self, shard_id: str, *, provider_batch_id: str) -> bool:
+        """submit 之后**立刻**写入 batch id：轮询超时时它是恢复的唯一凭据。"""
+
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE ingestion_shards SET provider_batch_id = %s, updated_at = %s "
+            "WHERE shard_id = %s",
+            (provider_batch_id[:120], now, shard_id),
+        )
+        return affected > 0
+
+    def mark_success(
+        self,
+        shard_id: str,
+        *,
+        extracted_text: str,
+        reused: bool = False,
+        blocks_json: str | None = None,
+    ) -> bool:
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE ingestion_shards SET status = %s, extracted_text = %s, char_count = %s, "
+            "reused = %s, blocks_json = %s, failure_code = NULL, updated_at = %s, "
+            "finished_at = %s WHERE shard_id = %s AND status <> %s",
+            (
+                SHARD_STATUS_SUCCESS,
+                extracted_text,
+                len(extracted_text),
+                1 if reused else 0,
+                blocks_json,
+                now,
+                now,
+                shard_id,
+                SHARD_STATUS_SUCCESS,
+            ),
+        )
+        return affected > 0
+
+    def mark_failed(self, shard_id: str, *, failure_code: str) -> bool:
+        now = utc_now()
+        affected = self.pool.execute(
+            "UPDATE ingestion_shards SET status = %s, failure_code = %s, updated_at = %s, "
+            "finished_at = %s WHERE shard_id = %s AND status <> %s",
+            (SHARD_STATUS_FAILED, failure_code[:64], now, now, shard_id, SHARD_STATUS_SUCCESS),
+        )
+        return affected > 0
+
+    def find_reusable(
+        self, *, sha256: str, parser_provider: str, parser_options: str
+    ) -> IngestionShardRecord | None:
+        """复用键命中：同字节 + 同 provider + 同 options 的**成功**分片。
+
+        跨 index version、跨文档生效——只要字节与解析档位一致，解析结果就一致，
+        因此可以跳过 provider（ADR-037「成功分片不重复付费解析」）。
+        """
+
+        row = self.pool.query_one(
+            f"SELECT {SHARD_COLUMNS}, extracted_text, blocks_json FROM ingestion_shards "
+            "WHERE sha256 = %s AND parser_provider = %s AND parser_options = %s "
+            "AND status = %s AND extracted_text IS NOT NULL "
+            "ORDER BY finished_at DESC, created_at DESC LIMIT 1",
+            (sha256, parser_provider[:40], parser_options[:120], SHARD_STATUS_SUCCESS),
+        )
+        return _shard(row, with_text=True)
+
+    def find_resumable(
+        self, *, sha256: str, parser_provider: str, parser_options: str
+    ) -> IngestionShardRecord | None:
+        """找回已提交但未完成的分片：同键 + ``running`` + 有 batch id。
+
+        这就是「超时 ≠ 未创建」的落地方式：重试先续轮询这个 batch id，而不是重新提交。
+        """
+
+        row = self.pool.query_one(
+            f"SELECT {SHARD_COLUMNS} FROM ingestion_shards "
+            "WHERE sha256 = %s AND parser_provider = %s AND parser_options = %s "
+            "AND status = %s AND provider_batch_id IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (sha256, parser_provider[:40], parser_options[:120], SHARD_STATUS_RUNNING),
+        )
+        return _shard(row, with_text=False)
+
+    def delete_for_index_version(self, index_version: str) -> int:
+        return self.pool.execute(
+            "DELETE FROM ingestion_shards WHERE index_version = %s", (index_version,)
+        )
+
+
 def _document_file(row: tuple[Any, ...] | None) -> DocumentFileRecord | None:
     if row is None:
         return None
@@ -626,6 +990,35 @@ def _document_file(row: tuple[Any, ...] | None) -> DocumentFileRecord | None:
         source_name=str(row[5]),
         created_at=row[6],
         updated_at=row[7],
+    )
+
+
+def _shard(row: tuple[Any, ...] | None, *, with_text: bool) -> IngestionShardRecord | None:
+    if row is None:
+        return None
+    return IngestionShardRecord(
+        shard_id=str(row[0]),
+        ingestion_job_id=str(row[1]),
+        document_id=str(row[2]),
+        index_version=str(row[3]),
+        shard_index=int(row[4]),
+        page_start=int(row[5]) if row[5] is not None else None,
+        page_end=int(row[6]) if row[6] is not None else None,
+        byte_size=int(row[7]),
+        sha256=str(row[8]),
+        parser_provider=str(row[9]),
+        parser_options=str(row[10]),
+        provider_batch_id=row[11],
+        status=str(row[12]),
+        reused=bool(row[13]),
+        attempt=int(row[14]),
+        char_count=int(row[15]),
+        failure_code=row[16],
+        created_at=row[17],
+        updated_at=row[18],
+        finished_at=row[19],
+        extracted_text=str(row[20]) if with_text and row[20] is not None else None,
+        blocks_json=str(row[21]) if with_text and len(row) > 21 and row[21] is not None else None,
     )
 
 
@@ -671,6 +1064,8 @@ class DocumentContentRepository:
 # document_chunks.location 的列宽（与建表语句中的 VARCHAR(120) 对齐）。
 # 写入前显式截断，不依赖「当前定位串恰好很短」这一隐含假设。
 MAX_LOCATION_CHARS = 120
+# document_chunks.section_path 的列宽（ADR-038）。
+MAX_SECTION_PATH_CHARS = 300
 
 
 def bounded_location(location: str | None) -> str | None:
@@ -679,6 +1074,14 @@ def bounded_location(location: str | None) -> str | None:
     if location is None:
         return None
     return location[:MAX_LOCATION_CHARS]
+
+
+def bounded_section_path(section_path: str | None) -> str | None:
+    """把章节路径显式约束到 document_chunks.section_path 的列宽。"""
+
+    if section_path is None:
+        return None
+    return section_path[:MAX_SECTION_PATH_CHARS]
 
 
 class ChunkRepository:
@@ -693,8 +1096,9 @@ class ChunkRepository:
             cursor.executemany(
                 "INSERT INTO document_chunks (chunk_id, document_id, index_version, "
                 "parent_chunk_id, "
-                "chunk_role, ordinal, content, location, label, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "chunk_role, ordinal, content, location, label, section_path, block_type, "
+                "page_start, page_end, content_hash, token_count, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 [
                     (
                         chunk.chunk_id,
@@ -706,6 +1110,12 @@ class ChunkRepository:
                         chunk.content,
                         bounded_location(chunk.location),
                         chunk.label,
+                        bounded_section_path(chunk.section_path),
+                        chunk.block_type[:20],
+                        chunk.page_start,
+                        chunk.page_end,
+                        chunk.content_hash,
+                        chunk.token_count,
                         now,
                     )
                     for chunk in chunks
@@ -728,7 +1138,8 @@ class ChunkRepository:
         )
         rows = self.pool.query(
             "SELECT chunk_id, document_id, index_version, parent_chunk_id, chunk_role, ordinal, "
-            f"content, location, label FROM document_chunks WHERE 1 = 1 {version_clause}"
+            "content, location, label, section_path, block_type, page_start, page_end, "
+            f"content_hash, token_count FROM document_chunks WHERE 1 = 1 {version_clause}"
             f"AND chunk_id IN ({placeholders})",
             parameters,
         )
@@ -822,4 +1233,10 @@ def _chunk(row: tuple[Any, ...]) -> ChunkRecord:
         content=str(row[6]),
         location=row[7],
         label=str(row[8]),
+        section_path=row[9] if len(row) > 9 else None,
+        block_type=str(row[10]) if len(row) > 10 and row[10] else "paragraph",
+        page_start=int(row[11]) if len(row) > 11 and row[11] is not None else None,
+        page_end=int(row[12]) if len(row) > 12 and row[12] is not None else None,
+        content_hash=row[13] if len(row) > 13 else None,
+        token_count=int(row[14]) if len(row) > 14 and row[14] is not None else 0,
     )

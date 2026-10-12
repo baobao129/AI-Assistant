@@ -6,6 +6,7 @@ from backend.domain.state import initial_state
 from backend.infrastructure.config import Settings
 from backend.infrastructure.llm import (
     CapabilityResolver,
+    ExtractiveGroundedLLM,
     LLMCapabilities,
     LocalOpenAICompatibleLLM,
     MockGeneralLLM,
@@ -13,6 +14,19 @@ from backend.infrastructure.llm import (
     UnsupportedCapabilityError,
     create_llm_provider,
 )
+
+
+def test_extractive_reader_keeps_labels_with_selected_child_sentences():
+    provider = ExtractiveGroundedLLM()
+    prompt = (
+        "Context:\n[Travel | p2]\nEmployees must book economy class for short flights.\n\n"
+        "[背景 | parent]\nUnverified economy-class background.\n\n"
+        "Question: What does the travel policy say about economy class?"
+    )
+    answer = provider.generate(prompt, {})
+    assert "Employees must book economy class" in answer
+    assert "[Travel | p2]" in answer
+    assert "Unverified" not in answer
 
 
 def test_remote_is_the_default_complete_capability_profile_without_startup_connection(monkeypatch):
@@ -33,9 +47,13 @@ def test_remote_is_the_default_complete_capability_profile_without_startup_conne
     assert provider.capabilities == LLMCapabilities(
         streaming=True, structured_output=True, tool_calling=True
     )
-    assert "API key" in provider.generate(
-        "hello", initial_state(conversation_id="c", thread_id="t", run_id="r", user_input="hello")
-    )
+    from backend.infrastructure.llm import LLMProviderError
+
+    with pytest.raises(LLMProviderError, match="llm_unavailable"):
+        provider.generate(
+            "hello",
+            initial_state(conversation_id="c", thread_id="t", run_id="r", user_input="hello"),
+        )
 
 
 def test_local_profile_declares_each_capability_independently():
@@ -69,3 +87,54 @@ def test_mock_provider_declares_complete_capability_profile():
     assert CapabilityResolver.require(
         MockGeneralLLM(), "streaming", "structured_output", "tool_calling"
     ).tool_calling
+
+
+def test_stream_accepts_only_content_deltas_not_hidden_reasoning(monkeypatch):
+    import httpx
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"reasoning_content":"private","content":"正文"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"完成"},"finish_reason":"stop"}]}'
+            yield "data: [DONE]"
+
+    monkeypatch.setattr(httpx, "stream", lambda *args, **kwargs: Response())
+    provider = RemoteOpenAICompatibleLLM(
+        base_url="https://test.invalid", api_key="test-only", model="test"
+    )
+    assert list(provider.generate_stream("question", {})) == ["正文", "完成"]
+
+
+def test_incomplete_provider_stream_is_a_failure(monkeypatch):
+    import httpx
+
+    from backend.infrastructure.llm import LLMProviderError
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"incomplete"}}]}'
+
+    monkeypatch.setattr(httpx, "stream", lambda *args, **kwargs: Response())
+    provider = RemoteOpenAICompatibleLLM(
+        base_url="https://test.invalid", api_key="test-only", model="test"
+    )
+    with pytest.raises(LLMProviderError, match="llm_incomplete_stream"):
+        list(provider.generate_stream("question", {}))

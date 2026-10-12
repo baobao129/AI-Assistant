@@ -8,6 +8,7 @@
  */
 
 import { authHeaders } from "./api.js";
+import { errorMessage } from "./labels.js";
 
 export class RunStream {
   constructor(runId, { onEvent, onError, onClose, lastEventId = null } = {}) {
@@ -41,7 +42,7 @@ export class RunStream {
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         const error = new Error(
-          body?.error?.message || `Stream failed (${response.status})`,
+          errorMessage(body?.error, '连接已中断，请刷新对话查看结果。'),
         );
         error.status = response.status;
         throw error;
