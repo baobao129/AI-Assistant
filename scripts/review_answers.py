@@ -275,6 +275,20 @@ def original_pages(question: dict, answer: dict, pages: list[str]) -> dict[str, 
     return {str(i + 1): pages[i] for i in sorted(selected)}
 
 
+def validate_batch_ids(rubric_questions: list[dict], answer_questions: list[dict]) -> None:
+    """Keep the fixed 60-question denominator immutable and duplicate-free."""
+    rubric_ids = [q["question_id"] for q in rubric_questions]
+    answer_ids = [q["question_id"] for q in answer_questions]
+    if (
+        len(rubric_ids) != 60
+        or len(set(rubric_ids)) != 60
+        or len(answer_ids) != 60
+        or len(set(answer_ids)) != 60
+        or set(answer_ids) != set(rubric_ids)
+    ):
+        raise ValueError("fixed rubric/question IDs mismatch")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=Path, required=True)
@@ -292,15 +306,7 @@ def main() -> int:
         raise ValueError("only a complete immutable answer batch can be reviewed")
     rubric = json.loads(args.rubric.read_text(encoding="utf-8-sig"))
     questions = {q["question_id"]: q for q in rubric["questions"]}
-    hybrid_ids = [q["question_id"] for q in hybrid["questions"]]
-    if (
-        len(rubric["questions"]) != 60
-        or len(questions) != 60
-        or len(hybrid["questions"]) != 60
-        or len(set(hybrid_ids)) != 60
-        or set(hybrid_ids) != set(questions)
-    ):
-        raise ValueError("fixed rubric/question IDs mismatch")
+    validate_batch_ids(rubric["questions"], hybrid["questions"])
     pages = [page.extract_text() or "" for page in PdfReader(args.pdf).pages]
     fingerprint = {
         "batch_sha256": hashlib.sha256(args.batch.read_bytes()).hexdigest(),

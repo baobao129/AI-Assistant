@@ -8,7 +8,7 @@ from backend.graph.main import RAGNodes
 from backend.infrastructure.config import Settings
 from backend.infrastructure.parsers import DocumentBlock
 from backend.infrastructure.structure_chunking import chunk_blocks
-from scripts.review_answers import normalize_grade, summarize
+from scripts.review_answers import normalize_grade, summarize, validate_batch_ids
 
 
 def _question() -> dict:
@@ -70,6 +70,14 @@ def test_normalize_grade_requires_each_fact_and_citation_once() -> None:
         "citation_correct"
     ]
     assert not normalize_grade(json.dumps(invalid), _question(), _answer())["citations"][1]["valid"]
+
+
+def test_fixed_batch_rejects_duplicate_question_ids() -> None:
+    rubric = [{"question_id": f"Q-{i:03}"} for i in range(60)]
+    answers = list(rubric)
+    answers[-1] = answers[0]
+    with pytest.raises(ValueError, match="fixed rubric"):
+        validate_batch_ids(rubric, answers)
 
 
 def test_summarize_records_numerators_denominators_and_no_go() -> None:
