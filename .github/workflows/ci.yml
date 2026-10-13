@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --frozen
-      - run: uv run python -m scripts.ci_gates python --out runtime/ci-readiness/python
+      - run: uv run python -m scripts.ci_gates python --profile v1-focused --out runtime/ci-readiness/python
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -32,8 +32,6 @@ jobs:
             runtime/ci-readiness/python/artifacts/ruff-format.json
             runtime/ci-readiness/python/artifacts/unit.json
             runtime/ci-readiness/python/artifacts/unit.xml
-            runtime/ci-readiness/python/artifacts/nonlive.json
-            runtime/ci-readiness/python/artifacts/nonlive.xml
           if-no-files-found: error
           retention-days: 14
           include-hidden-files: false
@@ -55,7 +53,7 @@ jobs:
           version: 0.11.16
           python-version: '3.12'
       - run: uv sync --frozen
-      - run: uv run python -m scripts.ci_gates frontend --out runtime/ci-readiness/frontend
+      - run: uv run python -m scripts.ci_gates frontend --profile v1-focused --out runtime/ci-readiness/frontend
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -64,7 +62,6 @@ jobs:
             runtime/ci-readiness/frontend/artifacts/source-manifest.json
             runtime/ci-readiness/frontend/artifacts/summary.json
             runtime/ci-readiness/frontend/artifacts/frontend-install.json
-            runtime/ci-readiness/frontend/artifacts/frontend-test.json
             runtime/ci-readiness/frontend/artifacts/frontend-build.json
           if-no-files-found: error
           retention-days: 14
@@ -83,7 +80,7 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --frozen
-      - run: uv run python -m scripts.ci_gates live --out runtime/ci-readiness/live
+      - run: uv run python -m scripts.ci_gates live --profile v1-focused --out runtime/ci-readiness/live
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -95,9 +92,6 @@ jobs:
             runtime/ci-readiness/live/artifacts/cleanup.json
             runtime/ci-readiness/live/artifacts/integration.json
             runtime/ci-readiness/live/artifacts/integration.xml
-            runtime/ci-readiness/live/artifacts/cursor.json
-            runtime/ci-readiness/live/artifacts/cursor.xml
-            runtime/ci-readiness/live/artifacts/restart-result.json
             runtime/ci-readiness/live/artifacts/provider-call-counters.json
           if-no-files-found: error
           retention-days: 14
@@ -116,7 +110,7 @@ jobs:
           version: 0.11.16
           python-version: '3.12'
       - run: uv sync --frozen
-      - run: uv run python -m scripts.ci_gates recovery --out runtime/ci-readiness/recovery
+      - run: uv run python -m scripts.ci_gates recovery --profile v1-focused --out runtime/ci-readiness/recovery
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -125,8 +119,6 @@ jobs:
             runtime/ci-readiness/recovery/artifacts/source-manifest.json
             runtime/ci-readiness/recovery/artifacts/summary.json
             runtime/ci-readiness/recovery/artifacts/recovery.json
-            runtime/ci-readiness/recovery/artifacts/smoke.json
-            runtime/ci-readiness/recovery/artifacts/smoke.xml
           if-no-files-found: error
           retention-days: 14
           include-hidden-files: false

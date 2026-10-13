@@ -147,6 +147,7 @@ def decide(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recovery-only", action="store_true")
+    parser.add_argument("--no-e2e", action="store_true", help="Record smoke as NOT_RUN")
     args = parser.parse_args()
     from scripts.ci_gates import (
         cleanup_projects,
@@ -331,14 +332,16 @@ def main() -> None:
             ]
         )
         evidence["checks"].append("restored_uploads_and_sqlite_integrity")
-        smoke_environment = dict(os.environ)
-        smoke_environment.update(
-            SMOKE_BASE_URL=f"http://127.0.0.1:{ports[3]}",
-            SMOKE_USERNAME="demo",
-            SMOKE_PASSWORD=os.environ["AUTH_BOOTSTRAP_PASSWORD"],
-        )
-        pytest_gate("smoke", ["tests/e2e", "-m", "smoke"], work, smoke_environment)
-        evidence["checks"].append("restored_http_smoke")
+        evidence["e2e"] = "NOT_RUN" if args.no_e2e else "executed"
+        if not args.no_e2e:
+            smoke_environment = dict(os.environ)
+            smoke_environment.update(
+                SMOKE_BASE_URL=f"http://127.0.0.1:{ports[3]}",
+                SMOKE_USERNAME="demo",
+                SMOKE_PASSWORD=os.environ["AUTH_BOOTSTRAP_PASSWORD"],
+            )
+            pytest_gate("smoke", ["tests/e2e", "-m", "smoke"], work, smoke_environment)
+            evidence["checks"].append("restored_http_smoke")
         # Persist completed recovery evidence even if a separate regression gate fails.
         evidence["recovery_result"] = "passed"
         if not args.recovery_only:

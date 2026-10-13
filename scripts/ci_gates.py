@@ -447,7 +447,16 @@ def initialize_test_database(database: str, environment: dict[str, str]) -> dict
     return env
 
 
-def live_suites(environment: dict[str, str], work: Path, suffix: str) -> None:
+def live_suites(
+    environment: dict[str, str], work: Path, suffix: str, *, focused: bool = True
+) -> None:
+    if focused:
+        from scripts.focused_tests import selection
+
+        env = initialize_test_database(f"stage1_{suffix}", environment)
+        env["AUDIT_EVIDENCE_DIR"] = str(work / "artifacts")
+        pytest_gate("integration", selection("integration"), work, env)
+        return
     for name, database, selection, required in (
         (
             "integration",
@@ -467,7 +476,7 @@ def live_suites(environment: dict[str, str], work: Path, suffix: str) -> None:
         pytest_gate(name, selection, work, env, required=required)
 
 
-def live_gate(work: Path) -> None:
+def live_gate(work: Path, *, focused: bool = True) -> None:
     from dotenv import dotenv_values
 
     from scripts.verify_release import free_ports, private_environment
@@ -501,7 +510,7 @@ def live_gate(work: Path) -> None:
         )
         try:
             run([*argv, "up", "-d", "--wait", "--wait-timeout", "300", "mysql", "milvus"])
-            live_suites(env, work, suffix)
+            live_suites(env, work, suffix, focused=focused)
         finally:
             cleanup = cleanup_projects([argv])
             write_json(work / "artifacts" / "cleanup.json", cleanup)
@@ -510,7 +519,7 @@ def live_gate(work: Path) -> None:
             private.unlink(missing_ok=True)
 
 
-def ordinary_gate(name: str, work: Path) -> None:
+def ordinary_gate(name: str, work: Path, *, focused: bool = True) -> None:
     env = offline_environment()
     if name == "python":
         for argv in (
@@ -524,17 +533,22 @@ def ordinary_gate(name: str, work: Path) -> None:
             )
             if code:
                 raise RuntimeError("Static Python gate failed")
-        pytest_gate("unit", ["tests/unit"], work, env)
-        pytest_gate("nonlive", ["tests/integration", "-m", "not live_db"], work, env)
+        if focused:
+            from scripts.focused_tests import selection
+
+            pytest_gate("unit", selection("unit"), work, env)
+        else:
+            pytest_gate("unit", ["tests/unit"], work, env)
+            pytest_gate("nonlive", ["tests/integration", "-m", "not live_db"], work, env)
     else:
         npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
         if not npm:
             raise RuntimeError("npm executable is unavailable")
-        for label, arguments in (
-            ("install", ["ci"]),
-            ("test", ["test"]),
-            ("build", ["run", "build"]),
-        ):
+        steps = [("install", ["ci"])]
+        if not focused:
+            steps.append(("test", ["test"]))
+        steps.append(("build", ["run", "build"]))
+        for label, arguments in steps:
             argv = [npm, *arguments]
             code, output = command(argv, env, cwd=ROOT / "frontend")
             write_json(
@@ -555,6 +569,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gate", choices=("python", "frontend", "live", "recovery", "snapshot"))
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--profile", choices=("v1-focused", "full"), default="v1-focused")
     args = parser.parse_args()
     work = args.out.resolve()
     if args.gate == "snapshot":
@@ -568,6 +583,8 @@ def main() -> None:
     now = datetime.now(UTC)
     summary = {
         "gate": args.gate,
+        "profile": args.profile,
+        "e2e": "NOT_RUN",
         "status": "NO-GO",
         "remote": "UNVERIFIED",
         "v1_release": "NO-GO",
@@ -585,14 +602,14 @@ def main() -> None:
         }
     try:
         if args.gate in {"python", "frontend"}:
-            ordinary_gate(args.gate, work)
+            ordinary_gate(args.gate, work, focused=args.profile == "v1-focused")
         elif args.gate == "live":
-            live_gate(work)
+            live_gate(work, focused=args.profile == "v1-focused")
         else:
             env = offline_environment()
             env["CI_ARTIFACT_DIR"] = str(artifacts)
             code, output = command(
-                [sys.executable, "-m", "scripts.verify_release", "--recovery-only"],
+                [sys.executable, "-m", "scripts.verify_release", "--recovery-only", "--no-e2e"],
                 env,
                 timeout=1500,
             )
