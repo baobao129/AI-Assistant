@@ -292,11 +292,13 @@ def main() -> int:
         raise ValueError("only a complete immutable answer batch can be reviewed")
     rubric = json.loads(args.rubric.read_text(encoding="utf-8-sig"))
     questions = {q["question_id"]: q for q in rubric["questions"]}
+    hybrid_ids = [q["question_id"] for q in hybrid["questions"]]
     if (
         len(rubric["questions"]) != 60
         or len(questions) != 60
         or len(hybrid["questions"]) != 60
-        or {q["question_id"] for q in hybrid["questions"]} != set(questions)
+        or len(set(hybrid_ids)) != 60
+        or set(hybrid_ids) != set(questions)
     ):
         raise ValueError("fixed rubric/question IDs mismatch")
     pages = [page.extract_text() or "" for page in PdfReader(args.pdf).pages]
