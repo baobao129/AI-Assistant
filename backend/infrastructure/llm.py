@@ -47,6 +47,10 @@ class UnsupportedCapabilityError(ValueError):
 class LLMProviderError(RuntimeError):
     """Safe provider boundary error without response bodies or credentials."""
 
+    def __init__(self, code: str, *, failure_kind: str = "unknown") -> None:
+        super().__init__(code)
+        self.failure_kind = failure_kind
+
 
 class GeneralLLM(Protocol):
     def generate(self, user_input: str, state: GraphState) -> str: ...
@@ -148,9 +152,16 @@ class RemoteOpenAICompatibleLLM:
             content = response.json()["choices"][0]["message"]["content"]
             if isinstance(content, str) and content.strip():
                 return content.strip()
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
-            pass
-        raise LLMProviderError("llm_unavailable")
+        except httpx.TimeoutException:
+            raise LLMProviderError("llm_unavailable", failure_kind="timeout") from None
+        except httpx.HTTPStatusError as error:
+            kind = "http_server" if error.response.status_code >= 500 else "http_client"
+            raise LLMProviderError("llm_unavailable", failure_kind=kind) from None
+        except httpx.HTTPError:
+            raise LLMProviderError("llm_unavailable", failure_kind="transport") from None
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise LLMProviderError("llm_unavailable", failure_kind="malformed_response") from None
+        raise LLMProviderError("llm_unavailable", failure_kind="empty_response")
 
     def generate_stream(self, user_input: str, state: GraphState) -> Iterator[str]:
         del state

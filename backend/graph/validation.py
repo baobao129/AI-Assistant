@@ -145,10 +145,12 @@ def _has_grounding(
         return False
     # A direct opposite rule cannot pass just because topic words overlap.
     negation_pattern = r"\b(?:not|never|prohibited)\b|不得|禁止|不允许|不能"
-    for sentence in re.split(r"[。.!?！？\n]", body):
+    # Compare polarity within one clause. A negation in a neighbouring clause
+    # cannot invert an otherwise identical supported proposition.
+    for sentence in re.split(r"[。.!?！？\n，,；;]", body):
         if not sentence.strip():
             continue
-        for source in re.split(r"[。.!?！？\n]", evidence):
+        for source in re.split(r"[。.!?！？\n，,；;]", evidence):
             shared = _grounding_terms(sentence) & _grounding_terms(source)
             if len(shared) >= 3:
                 negative = re.search(negation_pattern, sentence)

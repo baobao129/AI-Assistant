@@ -2,6 +2,7 @@
 
 UNIT_TESTS = [
     "tests/unit/test_v1_closure.py",
+    "tests/unit/test_v1_reliability.py",
     "tests/unit/test_evidence_validation.py::test_semantic_judge_cannot_override_wrong_numbers_or_direct_negation",
     "tests/unit/test_evidence_validation.py::test_semantic_judge_fails_closed_on_malformed_or_unknown_source",
     "tests/unit/test_retrieval_evaluation.py::test_generation_fingerprint_survives_json_roundtrip",

@@ -10,12 +10,14 @@ import argparse
 import hashlib
 import json
 import re
+import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from backend.infrastructure.config import Settings
-from backend.infrastructure.llm import GeneralLLM, create_llm_provider
+from backend.infrastructure.llm import GeneralLLM, LLMProviderError, create_llm_provider
 
 PROTOCOL = "v1-original-text-independent-review-1"
 PROMPT = (
@@ -146,15 +148,21 @@ def grade_answer(provider: GeneralLLM, question: dict, answer: dict, pages: dict
         "citations": answer.get("citations") or [],
         "original_pages": pages,
     }
+    started = time.monotonic()
+    prompt_chars = 0
     try:
         prompt = PROMPT + json.dumps(data, ensure_ascii=False)
+        prompt_chars = len(prompt)
         if len(prompt) > 95000:
             raise ValueError("review input exceeds bound")
-        return normalize_grade(provider.generate(prompt, {}), question, answer)
+        grade = normalize_grade(provider.generate(prompt, {}), question, answer)
     except Exception as error:  # noqa: BLE001 - never expose provider text or credentials
-        return {
+        grade = {
             "status": "failed",
             "error_type": type(error).__name__,
+            "failure_kind": error.failure_kind
+            if isinstance(error, LLMProviderError)
+            else "review_format",
             "safe_refusal": False,
             "facts": [
                 {
@@ -169,6 +177,12 @@ def grade_answer(provider: GeneralLLM, question: dict, answer: dict, pages: dict
             ],
             "citations": [],
         }
+    grade["invocation"] = {
+        "attempts": 1,
+        "prompt_chars": prompt_chars,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+    return grade
 
 
 def _ratio(numerator: int, denominator: int) -> dict:
@@ -249,12 +263,20 @@ def summarize(records: list[dict]) -> dict:
     }
 
 
+def _anchor_text(text: str) -> str:
+    # PDF ligatures and Markdown escaping are representation differences only.
+    # Keep punctuation, words, numbers and polarity; never use fuzzy matching.
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text).replace(r"\_", "_"))
+
+
 def original_pages(question: dict, answer: dict, pages: list[str]) -> dict[str, str]:
     """Use PDF original text, including reference anchors and supplied citation locations."""
-    normalized = [re.sub(r"\s+", "", page) for page in pages]
+    normalized = [_anchor_text(page) for page in pages]
     selected = set()
     for quote in question["source_quotes"]:
-        anchor = re.sub(r"\s+", "", quote)
+        anchor = _anchor_text(quote)
+        if not anchor:
+            raise ValueError("reference anchor empty")
         found = [
             i
             for i in range(len(pages))
@@ -296,10 +318,16 @@ def main() -> int:
     parser.add_argument("--pdf", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--review-timeout-seconds", type=float)
     args = parser.parse_args()
     from pypdf import PdfReader
 
     settings = Settings()
+    if args.review_timeout_seconds is not None:
+        if not 0 < args.review_timeout_seconds <= 120:
+            parser.error("review timeout must be in (0, 120]")
+        # Offline reviewer reliability only; production configuration is unchanged.
+        settings = settings.model_copy(update={"llm_timeout_seconds": args.review_timeout_seconds})
     payload = json.loads(args.batch.read_text(encoding="utf-8-sig"))
     hybrid = next(r for r in payload["measurements"] if r["mode"] == "hybrid_rerank")
     if hybrid.get("generation_status") != "complete":
@@ -315,6 +343,10 @@ def main() -> int:
         "pdf_sha256": hashlib.sha256(args.pdf.read_bytes()).hexdigest(),
         "reviewer_model": settings.llm_model,
         "reviewer_provider": settings.llm_provider,
+        "reviewer_timeout_seconds": settings.llm_timeout_seconds,
+        "reviewer_base_url": settings.llm_base_url,
+        "reviewer_attempts": 1,
+        "anchor_normalization": "nfkc-markdown-underscore-exact-1",
         "protocol": PROTOCOL,
         "prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
         "code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

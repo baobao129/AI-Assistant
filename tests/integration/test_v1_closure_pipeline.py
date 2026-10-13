@@ -5,7 +5,7 @@ from backend.infrastructure.config import Settings
 from backend.infrastructure.parsers import DocumentBlock
 from backend.infrastructure.structure_chunking import chunk_blocks, with_page_offset
 from backend.infrastructure.token_budget import estimate_tokens
-from scripts.review_answers import grade_answer
+from scripts.review_answers import grade_answer, original_pages
 
 
 def test_grading_uses_original_pages_and_separate_invocation() -> None:
@@ -23,9 +23,14 @@ def test_grading_uses_original_pages_and_separate_invocation() -> None:
             )
 
     reviewer = Reviewer()
-    question = {"question": "问题", "required_facts": ["事实"], "source_quotes": ["事实"]}
+    question = {
+        "question": "问题",
+        "required_facts": ["事实"],
+        "source_quotes": [r"原文 tool\_call\_id"],
+    }
     answer = {"final_answer": "答案", "citations": [{"page_start": 1}], "refused": False}
-    grade = grade_answer(reviewer, question, answer, {"1": "原始页面事实"})
+    pages = original_pages(question, answer, ["原始页面事实：原文 tool_call_id"])
+    grade = grade_answer(reviewer, question, answer, pages)
     assert grade["status"] == "scored"
     assert len(reviewer.prompts) == 1
     assert "原始页面事实" in reviewer.prompts[0][0]
