@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -383,6 +384,13 @@ class RAGNodes:
             # The estimator is not additive at whitespace/token boundaries.
             while excerpt and estimate_tokens(prefix + excerpt) > token_budget:
                 excerpt = excerpt[:-1].rstrip()
+            if len(excerpt) < len(body):
+                # A clipped clause must not turn into apparent complete evidence.
+                # Keep a complete sentence when one exists; otherwise retain the
+                # bounded fragment for the fail-closed answer validator.
+                ends = list(re.finditer(r"[。！？!?]|\.(?=\s|$)|\n", excerpt))
+                if ends and ends[-1].end() >= len(excerpt) // 2:
+                    excerpt = excerpt[: ends[-1].end()].rstrip()
             return excerpt
 
         for item in (state.get("retrieval_results") or [])[: self.settings.max_retrieval_top_k]:

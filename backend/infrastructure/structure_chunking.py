@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -148,9 +149,26 @@ def _section_paths(
     for block in blocks:
         if block.block_type == "heading" and block.heading_level:
             level = int(block.heading_level)
+            title = _bounded_title(block.text, max_chars=max_chars)
+            # Some parser headings use inconsistent levels across PDF shards.
+            # An explicitly numbered chapter is a peer of the preceding chapter;
+            # it cannot inherit that chapter merely because text_level increased.
+            if re.match(r"^第\s*[0-9一二三四五六七八九十百]+\s*章(?:\s|[：:、]|$)", title):
+                preceding = next(
+                    (
+                        depth
+                        for depth, text in stack
+                        if re.match(
+                            r"^第\s*[0-9一二三四五六七八九十百]+\s*章(?:\s|[：:、]|$)", text
+                        )
+                    ),
+                    None,
+                )
+                if preceding is not None:
+                    level = preceding
             while stack and stack[-1][0] >= level:
                 stack.pop()
-            stack.append((level, _bounded_title(block.text, max_chars=max_chars)))
+            stack.append((level, title))
         titles = [title for _, title in stack[:max_depth]]
         path = " / ".join(title for title in titles if title)
         paths.append(path[:max_chars] if path else None)
